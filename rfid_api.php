@@ -129,33 +129,76 @@ $isDup = $stmt->fetch();
 $stmt->close();
 
 if ($isDup) {
-    echo json_encode([
+    $dupReleased = ['seats' => 0, 'computers' => 0];
+    if ($existingAction === 'TIME_OUT' && $card['user_id'] !== null) {
+        try {
+            $dupReleased = rfidApiAutoReleaseAllocations($conn, (int) $card['user_id']);
+        } catch (Throwable $e) {
+            error_log('[rfid_api] Duplicate TIME_OUT auto-release failed: ' . $e->getMessage());
+        }
+    }
+
+    $dupPayload = [
         'status' => 'duplicate',
         'msg' => 'Event already recorded',
         'name' => $card['name'],
         'action' => $existingAction,
         'retryable' => false,
-    ]);
+    ];
+    if ($existingAction === 'TIME_OUT' && $card['user_id'] !== null) {
+        $dupPayload['released_seats'] = $dupReleased['seats'];
+        $dupPayload['released_computers'] = $dupReleased['computers'];
+    }
+
+    echo json_encode($dupPayload);
     exit;
 }
 
-if ($action === 'TIME_OUT') {
-    $guard = $conn->prepare(
-        "SELECT id FROM attendance WHERE uid=? AND date=? AND action='TIME_OUT' LIMIT 1"
-    );
-    $guard->bind_param('ss', $uid, $date);
-    $guard->execute();
-    $guard->store_result();
-    $alreadyOut = $guard->num_rows > 0;
-    $guard->close();
-
-    if ($alreadyOut) {
+if ($action === 'TIME_IN') {
+    if (rfidApiHasAttendanceActionToday($conn, $uid, $card['user_id'], $date, 'TIME_IN')) {
         echo json_encode([
+            'status' => 'already_timed_in',
+            'msg' => $card['name'] . ' already timed in today',
+            'name' => $card['name'],
+            'retryable' => false,
+        ]);
+        exit;
+    }
+}
+
+if ($action === 'TIME_OUT') {
+    if (!rfidApiHasAttendanceActionToday($conn, $uid, $card['user_id'], $date, 'TIME_IN')) {
+        echo json_encode([
+            'status' => 'missing_time_in',
+            'msg' => $card['name'] . ' must TIME_IN first before TIME_OUT',
+            'name' => $card['name'],
+            'retryable' => false,
+        ]);
+        exit;
+    }
+
+    if (rfidApiHasAttendanceActionToday($conn, $uid, $card['user_id'], $date, 'TIME_OUT')) {
+        $alreadyReleased = ['seats' => 0, 'computers' => 0];
+        if ($card['user_id'] !== null) {
+            try {
+                $alreadyReleased = rfidApiAutoReleaseAllocations($conn, (int) $card['user_id']);
+            } catch (Throwable $e) {
+                error_log('[rfid_api] Already-timed-out auto-release failed: ' . $e->getMessage());
+            }
+        }
+
+        $alreadyPayload = [
             'status' => 'already_timed_out',
             'msg' => $card['name'] . ' already timed out today',
             'name' => $card['name'],
             'retryable' => false,
-        ]);
+        ];
+        if ($card['user_id'] !== null) {
+            $alreadyPayload['released_seats'] = $alreadyReleased['seats'];
+            $alreadyPayload['released_computers'] = $alreadyReleased['computers'];
+        }
+
+        echo json_encode($alreadyPayload);
         exit;
     }
 }
@@ -299,6 +342,61 @@ function rfidApiLookupUserIdFromIdentity(mysqli $conn, string $identity): ?int
     return $cache[$identity];
 }
 
+function rfidApiLookupUserIdFromDeviceUid(mysqli $conn, string $uid): ?int
+{
+    static $cache = [];
+    if (array_key_exists($uid, $cache)) {
+        return $cache[$uid];
+    }
+
+    if (!rfidApiTableExists($conn, 'rfid_devices') || !rfidApiColumnExists($conn, 'rfid_devices', 'user_id')) {
+        $cache[$uid] = null;
+        return null;
+    }
+
+    $whereStatus = rfidApiColumnExists($conn, 'rfid_devices', 'status')
+        ? " AND status = 'active'"
+        : '';
+    $stmt = $conn->prepare('SELECT user_id FROM rfid_devices WHERE uid = ?' . $whereStatus . ' LIMIT 1');
+    $stmt->bind_param('s', $uid);
+    $stmt->execute();
+    $stmt->bind_result($userId);
+    $found = $stmt->fetch();
+    $stmt->close();
+
+    $cache[$uid] = $found ? (int) $userId : null;
+    return $cache[$uid];
+}
+
+function rfidApiLookupLastAttendanceUserId(mysqli $conn, string $uid): ?int
+{
+    static $cache = [];
+    if (array_key_exists($uid, $cache)) {
+        return $cache[$uid];
+    }
+
+    if (!rfidApiColumnExists($conn, 'attendance', 'user_id')) {
+        $cache[$uid] = null;
+        return null;
+    }
+
+    $stmt = $conn->prepare(
+        'SELECT user_id
+         FROM attendance
+         WHERE uid = ? AND user_id IS NOT NULL
+         ORDER BY id DESC
+         LIMIT 1'
+    );
+    $stmt->bind_param('s', $uid);
+    $stmt->execute();
+    $stmt->bind_result($userId);
+    $found = $stmt->fetch();
+    $stmt->close();
+
+    $cache[$uid] = $found ? (int) $userId : null;
+    return $cache[$uid];
+}
+
 function rfidApiResolveUid(mysqli $conn, string $uid): ?array
 {
     $schema = rfidApiSchema($conn);
@@ -331,6 +429,12 @@ function rfidApiResolveUid(mysqli $conn, string $uid): ?array
         if ($found) {
             if ($userId === null) {
                 $userId = rfidApiLookupUserIdFromIdentity($conn, (string) $name);
+            }
+            if ($userId === null) {
+                $userId = rfidApiLookupUserIdFromDeviceUid($conn, $uid);
+            }
+            if ($userId === null) {
+                $userId = rfidApiLookupLastAttendanceUserId($conn, $uid);
             }
 
             return [
@@ -366,6 +470,31 @@ function rfidApiResolveUid(mysqli $conn, string $uid): ?array
     }
 
     return null;
+}
+
+function rfidApiHasAttendanceActionToday(
+    mysqli $conn,
+    string $uid,
+    ?int $userId,
+    string $date,
+    string $action
+): bool {
+    $useUserId = $userId !== null && rfidApiColumnExists($conn, 'attendance', 'user_id');
+
+    if ($useUserId) {
+        $stmt = $conn->prepare('SELECT id FROM attendance WHERE user_id = ? AND date = ? AND action = ? LIMIT 1');
+        $stmt->bind_param('iss', $userId, $date, $action);
+    } else {
+        $stmt = $conn->prepare('SELECT id FROM attendance WHERE uid = ? AND date = ? AND action = ? LIMIT 1');
+        $stmt->bind_param('sss', $uid, $date, $action);
+    }
+
+    $stmt->execute();
+    $stmt->store_result();
+    $exists = $stmt->num_rows > 0;
+    $stmt->close();
+
+    return $exists;
 }
 
 function rfidApiReleaseUserItems(mysqli $conn, string $table, int $userId): int

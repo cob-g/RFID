@@ -29,6 +29,12 @@ const RESERVATION_CONFIRM_WINDOW_MINUTES = 15;
 
 function isUserTimedInToday(mysqli $conn, int $userId): bool
 {
+    $latestAction = seatSystemLatestAttendanceActionToday($conn, $userId);
+    return $latestAction === 'TIME_IN';
+}
+
+function seatSystemLatestAttendanceActionToday(mysqli $conn, int $userId): ?string
+{
     try {
         $stmt = $conn->prepare(
             'SELECT action
@@ -42,10 +48,15 @@ function isUserTimedInToday(mysqli $conn, int $userId): bool
         $row = $stmt->get_result()->fetch_assoc();
         $stmt->close();
 
-        return $row && ($row['action'] ?? '') === 'TIME_IN';
+        $action = strtoupper(trim((string) ($row['action'] ?? '')));
+        if ($action === 'TIME_IN' || $action === 'TIME_OUT') {
+            return $action;
+        }
+
+        return null;
     } catch (Throwable $e) {
         error_log('[SeatSystem] timed-in check failed: ' . $e->getMessage());
-        return false;
+        return null;
     }
 }
 
@@ -111,15 +122,109 @@ function seatSystemCleanupExpiredPendingAllocations(mysqli $conn): array
     ];
 }
 
-seatSystemCleanupExpiredPendingAllocations($conn);
+function seatSystemConfirmPendingForUserInTable(mysqli $conn, string $table, int $userId): int
+{
+    if (
+        !seatSystemColumnExists($conn, $table, 'status')
+        || !seatSystemColumnExists($conn, $table, 'reserved_by')
+        || !seatSystemColumnExists($conn, $table, 'expires_at')
+    ) {
+        return 0;
+    }
 
-$userTimedInNow = isUserTimedInToday($conn, $user_id);
+    $setParts = ['expires_at=NULL'];
+    if (seatSystemColumnExists($conn, $table, 'reservation_status')) {
+        $setParts[] = "reservation_status='confirmed'";
+    }
+
+    $where = "reserved_by = ? AND status='reserved' AND expires_at IS NOT NULL AND expires_at >= NOW()";
+    if (seatSystemColumnExists($conn, $table, 'reservation_status')) {
+        $where .= " AND reservation_status='pending'";
+    }
+
+    $sql = 'UPDATE ' . $table . ' SET ' . implode(', ', $setParts) . ' WHERE ' . $where;
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $affected = max(0, $stmt->affected_rows);
+    $stmt->close();
+
+    return $affected;
+}
+
+function seatSystemReleaseUserAllocationsInTable(mysqli $conn, string $table, int $userId): int
+{
+    if (!seatSystemColumnExists($conn, $table, 'reserved_by')) {
+        return 0;
+    }
+
+    $setParts = [];
+    if (seatSystemColumnExists($conn, $table, 'status')) {
+        $setParts[] = "status='available'";
+    }
+    $setParts[] = 'reserved_by=NULL';
+    if (seatSystemColumnExists($conn, $table, 'reserved_at')) {
+        $setParts[] = 'reserved_at=NULL';
+    }
+    if (seatSystemColumnExists($conn, $table, 'expires_at')) {
+        $setParts[] = 'expires_at=NULL';
+    }
+    if (seatSystemColumnExists($conn, $table, 'reservation_status')) {
+        $setParts[] = 'reservation_status=NULL';
+    }
+
+    $sql = 'UPDATE ' . $table . ' SET ' . implode(', ', $setParts) . ' WHERE reserved_by = ?';
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $affected = max(0, $stmt->affected_rows);
+    $stmt->close();
+
+    return $affected;
+}
+
+function seatSystemSyncAllocationsByAttendance(mysqli $conn, int $userId): array
+{
+    $latestAction = seatSystemLatestAttendanceActionToday($conn, $userId);
+    if ($latestAction === 'TIME_IN') {
+        return [
+            'timed_in' => true,
+            'confirmed_seats' => seatSystemConfirmPendingForUserInTable($conn, 'seats', $userId),
+            'confirmed_computers' => seatSystemConfirmPendingForUserInTable($conn, 'computers', $userId),
+            'released_seats' => 0,
+            'released_computers' => 0,
+        ];
+    }
+
+    if ($latestAction === 'TIME_OUT') {
+        return [
+            'timed_in' => false,
+            'confirmed_seats' => 0,
+            'confirmed_computers' => 0,
+            'released_seats' => seatSystemReleaseUserAllocationsInTable($conn, 'seats', $userId),
+            'released_computers' => seatSystemReleaseUserAllocationsInTable($conn, 'computers', $userId),
+        ];
+    }
+
+    return [
+        'timed_in' => false,
+        'confirmed_seats' => 0,
+        'confirmed_computers' => 0,
+        'released_seats' => 0,
+        'released_computers' => 0,
+    ];
+}
+
+seatSystemCleanupExpiredPendingAllocations($conn);
+$attendanceSync = seatSystemSyncAllocationsByAttendance($conn, $user_id);
+$userTimedInNow = (bool) $attendanceSync['timed_in'];
 
 if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['poll'])) {
     while (ob_get_level()) ob_end_clean();
     header('Content-Type: application/json; charset=utf-8');
 
     seatSystemCleanupExpiredPendingAllocations($conn);
+    $pollAttendanceSync = seatSystemSyncAllocationsByAttendance($conn, $user_id);
 
     $seatRows = mysqli_fetch_all(
         mysqli_query($conn, 'SELECT id, seat_number, status, reserved_by, reserved_at, expires_at FROM seats'),
@@ -134,7 +239,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['poll'])) {
         'seats'     => $seatRows,
         'computers' => $compRows,
         'user_id'   => $user_id,
-        'timed_in'  => isUserTimedInToday($conn, $user_id),
+        'timed_in'  => (bool) $pollAttendanceSync['timed_in'],
     ], JSON_UNESCAPED_UNICODE);
     exit;
 }
@@ -238,6 +343,24 @@ function logAllocation(
     }
 }
 
+function seatSystemHasReservedToday(mysqli $conn, int $userId): bool
+{
+    $stmt = $conn->prepare(
+        "SELECT COUNT(*)
+         FROM allocation_log
+         WHERE user_id = ?
+           AND action = 'reserved'
+           AND DATE(created_at) = CURDATE()"
+    );
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $stmt->bind_result($count);
+    $stmt->fetch();
+    $stmt->close();
+
+    return ((int) $count) > 0;
+}
+
 if ($isAjaxRequest) {
 
     seatSystemCleanupExpiredPendingAllocations($conn);
@@ -274,6 +397,15 @@ if ($isAjaxRequest) {
             $isRelease = ($peekSeat && (int)$peekSeat['reserved_by'] === $user_id);
 
             if (!$isRelease) {
+                // Temporarily disabled daily reservation limit for testing.
+                // if (seatSystemHasReservedToday($conn, $user_id)) {
+                //     $conn->rollback();
+                //     jsonResponse([
+                //         'success' => false,
+                //         'message' => 'Daily limit reached: you can reserve only once per day.',
+                //     ]);
+                // }
+
                 $limitStmt = $conn->prepare(
                     'SELECT
                         (SELECT COUNT(*) FROM seats     WHERE reserved_by = ?) +
@@ -294,25 +426,49 @@ if ($isAjaxRequest) {
             }
 
             $hasSeatReservationStatus = seatSystemColumnExists($conn, 'seats', 'reservation_status');
+            $reserveAsConfirmed = isUserTimedInToday($conn, $user_id);
             if ($hasSeatReservationStatus) {
-                $stmt = $conn->prepare(
-                    'UPDATE seats
-                     SET    status = "reserved",
-                            reserved_by = ?,
-                            reserved_at = NOW(),
-                            expires_at = DATE_ADD(NOW(), INTERVAL ' . RESERVATION_CONFIRM_WINDOW_MINUTES . ' MINUTE),
-                            reservation_status = "pending"
-                     WHERE  id = ? AND status = "available"'
-                );
+                if ($reserveAsConfirmed) {
+                    $stmt = $conn->prepare(
+                        'UPDATE seats
+                         SET    status = "reserved",
+                                reserved_by = ?,
+                                reserved_at = NOW(),
+                                expires_at = NULL,
+                                reservation_status = "confirmed"
+                         WHERE  id = ? AND status = "available"'
+                    );
+                } else {
+                    $stmt = $conn->prepare(
+                        'UPDATE seats
+                         SET    status = "reserved",
+                                reserved_by = ?,
+                                reserved_at = NOW(),
+                                expires_at = DATE_ADD(NOW(), INTERVAL ' . RESERVATION_CONFIRM_WINDOW_MINUTES . ' MINUTE),
+                                reservation_status = "pending"
+                         WHERE  id = ? AND status = "available"'
+                    );
+                }
             } else {
-                $stmt = $conn->prepare(
-                    'UPDATE seats
-                     SET    status = "reserved",
-                            reserved_by = ?,
-                            reserved_at = NOW(),
-                            expires_at = DATE_ADD(NOW(), INTERVAL ' . RESERVATION_CONFIRM_WINDOW_MINUTES . ' MINUTE)
-                     WHERE  id = ? AND status = "available"'
-                );
+                if ($reserveAsConfirmed) {
+                    $stmt = $conn->prepare(
+                        'UPDATE seats
+                         SET    status = "reserved",
+                                reserved_by = ?,
+                                reserved_at = NOW(),
+                                expires_at = NULL
+                         WHERE  id = ? AND status = "available"'
+                    );
+                } else {
+                    $stmt = $conn->prepare(
+                        'UPDATE seats
+                         SET    status = "reserved",
+                                reserved_by = ?,
+                                reserved_at = NOW(),
+                                expires_at = DATE_ADD(NOW(), INTERVAL ' . RESERVATION_CONFIRM_WINDOW_MINUTES . ' MINUTE)
+                         WHERE  id = ? AND status = "available"'
+                    );
+                }
             }
             $stmt->bind_param('ii', $user_id, $id);
             $stmt->execute();
@@ -387,16 +543,20 @@ if ($isAjaxRequest) {
             }
 
             if ($action === 'reserved') {
+                $isPending = !empty($seat['expires_at']);
                 jsonResponse([
                     'success' => true,
                     'action' => $action,
                     'label' => $seat['seat_number'],
                     'emailSent' => ($studentEmail !== ''),
                     'expires_at' => $seat['expires_at'] ?? null,
-                    'message' => 'Seat ' . $seat['seat_number']
-                        . ' reserved. Tap your RFID card to TIME_IN within '
-                        . RESERVATION_CONFIRM_WINDOW_MINUTES
-                        . ' minutes to confirm and keep this allocation.',
+                    'message' => $isPending
+                        ? ('Seat ' . $seat['seat_number']
+                            . ' reserved. Tap your RFID card to TIME_IN within '
+                            . RESERVATION_CONFIRM_WINDOW_MINUTES
+                            . ' minutes to confirm and keep this allocation.')
+                        : ('Seat ' . $seat['seat_number']
+                            . ' reserved and confirmed because your RFID status is already TIME_IN.'),
                 ]);
             }
 
@@ -429,6 +589,15 @@ if ($isAjaxRequest) {
             $isRelease = ($peekComp && (int)$peekComp['reserved_by'] === $user_id);
 
             if (!$isRelease) {
+                // Temporarily disabled daily reservation limit for testing.
+                // if (seatSystemHasReservedToday($conn, $user_id)) {
+                //     $conn->rollback();
+                //     jsonResponse([
+                //         'success' => false,
+                //         'message' => 'Daily limit reached: you can reserve only once per day.',
+                //     ]);
+                // }
+
                 $limitStmt = $conn->prepare(
                     'SELECT
                         (SELECT COUNT(*) FROM seats     WHERE reserved_by = ?) +
@@ -449,25 +618,49 @@ if ($isAjaxRequest) {
             }
 
             $hasComputerReservationStatus = seatSystemColumnExists($conn, 'computers', 'reservation_status');
+            $reserveAsConfirmed = isUserTimedInToday($conn, $user_id);
             if ($hasComputerReservationStatus) {
-                $stmt = $conn->prepare(
-                    'UPDATE computers
-                     SET    status = "reserved",
-                            reserved_by = ?,
-                            reserved_at = NOW(),
-                            expires_at = DATE_ADD(NOW(), INTERVAL ' . RESERVATION_CONFIRM_WINDOW_MINUTES . ' MINUTE),
-                            reservation_status = "pending"
-                     WHERE  id = ? AND status = "available"'
-                );
+                if ($reserveAsConfirmed) {
+                    $stmt = $conn->prepare(
+                        'UPDATE computers
+                         SET    status = "reserved",
+                                reserved_by = ?,
+                                reserved_at = NOW(),
+                                expires_at = NULL,
+                                reservation_status = "confirmed"
+                         WHERE  id = ? AND status = "available"'
+                    );
+                } else {
+                    $stmt = $conn->prepare(
+                        'UPDATE computers
+                         SET    status = "reserved",
+                                reserved_by = ?,
+                                reserved_at = NOW(),
+                                expires_at = DATE_ADD(NOW(), INTERVAL ' . RESERVATION_CONFIRM_WINDOW_MINUTES . ' MINUTE),
+                                reservation_status = "pending"
+                         WHERE  id = ? AND status = "available"'
+                    );
+                }
             } else {
-                $stmt = $conn->prepare(
-                    'UPDATE computers
-                     SET    status = "reserved",
-                            reserved_by = ?,
-                            reserved_at = NOW(),
-                            expires_at = DATE_ADD(NOW(), INTERVAL ' . RESERVATION_CONFIRM_WINDOW_MINUTES . ' MINUTE)
-                     WHERE  id = ? AND status = "available"'
-                );
+                if ($reserveAsConfirmed) {
+                    $stmt = $conn->prepare(
+                        'UPDATE computers
+                         SET    status = "reserved",
+                                reserved_by = ?,
+                                reserved_at = NOW(),
+                                expires_at = NULL
+                         WHERE  id = ? AND status = "available"'
+                    );
+                } else {
+                    $stmt = $conn->prepare(
+                        'UPDATE computers
+                         SET    status = "reserved",
+                                reserved_by = ?,
+                                reserved_at = NOW(),
+                                expires_at = DATE_ADD(NOW(), INTERVAL ' . RESERVATION_CONFIRM_WINDOW_MINUTES . ' MINUTE)
+                         WHERE  id = ? AND status = "available"'
+                    );
+                }
             }
             $stmt->bind_param('ii', $user_id, $id);
             $stmt->execute();
@@ -542,16 +735,20 @@ if ($isAjaxRequest) {
             }
 
             if ($action === 'reserved') {
+                $isPending = !empty($comp['expires_at']);
                 jsonResponse([
                     'success' => true,
                     'action' => $action,
                     'label' => $comp['computer_number'],
                     'emailSent' => ($studentEmail !== ''),
                     'expires_at' => $comp['expires_at'] ?? null,
-                    'message' => 'Computer ' . $comp['computer_number']
-                        . ' reserved. Tap your RFID card to TIME_IN within '
-                        . RESERVATION_CONFIRM_WINDOW_MINUTES
-                        . ' minutes to confirm and keep this allocation.',
+                    'message' => $isPending
+                        ? ('Computer ' . $comp['computer_number']
+                            . ' reserved. Tap your RFID card to TIME_IN within '
+                            . RESERVATION_CONFIRM_WINDOW_MINUTES
+                            . ' minutes to confirm and keep this allocation.')
+                        : ('Computer ' . $comp['computer_number']
+                            . ' reserved and confirmed because your RFID status is already TIME_IN.'),
                 ]);
             }
 
@@ -615,7 +812,9 @@ function seatButton(?array $seat, bool $forceDisabled = false): string
     $isMine = ((int)$seat['reserved_by'] === $user_id);
     $cls    = 'seat-button';
 
-    if ($isMine) {
+    if ($isMine && !empty($seat['expires_at'])) {
+        $cls .= ' pending-confirmation';
+    } elseif ($isMine) {
         $cls .= ' reserved-by-you';
     } elseif ($seat['status'] !== 'available') {
         $cls .= ' taken';
@@ -651,7 +850,9 @@ function computerButton(?array $comp): string
     $isMine = ((int)$comp['reserved_by'] === $user_id);
     $cls    = 'computer-button';
 
-    if ($isMine) {
+    if ($isMine && !empty($comp['expires_at'])) {
+        $cls .= ' pending-confirmation';
+    } elseif ($isMine) {
         $cls .= ' reserved-by-you';
     } elseif ($comp['status'] !== 'available') {
         $cls .= ' taken';
@@ -1201,13 +1402,25 @@ body {
 
 .seat-button.reserved-by-you,
 .computer-button.reserved-by-you {
-    background: linear-gradient(135deg, var(--gold) 0%, #a07840 100%);
-    color: #1a1208;
-    box-shadow: 0 2px 10px rgba(200, 169, 110, 0.38);
+    background: var(--seat-taken);
+    color: #fff;
+    box-shadow: 0 2px 10px rgba(239, 68, 68, 0.42);
 }
 .seat-button.reserved-by-you:hover:not(:disabled),
 .computer-button.reserved-by-you:hover:not(:disabled) {
-    box-shadow: 0 5px 18px rgba(200, 169, 110, 0.50);
+    box-shadow: 0 5px 18px rgba(239, 68, 68, 0.56);
+    filter: brightness(1.06);
+}
+
+.seat-button.pending-confirmation,
+.computer-button.pending-confirmation {
+    background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+    color: #1a1208;
+    box-shadow: 0 2px 10px rgba(245, 158, 11, 0.45);
+}
+.seat-button.pending-confirmation:hover:not(:disabled),
+.computer-button.pending-confirmation:hover:not(:disabled) {
+    box-shadow: 0 5px 18px rgba(245, 158, 11, 0.55);
     filter: brightness(1.06);
 }
 
@@ -1345,9 +1558,9 @@ body {
     flex-shrink: 0;
 }
 .legend-dot.available { background: var(--seat-avail); box-shadow: 0 0 8px rgba(34,197,94,0.40); }
-.legend-dot.reserved  {
-    background: linear-gradient(135deg, var(--gold) 0%, #a07840 100%);
-    box-shadow: 0 0 8px rgba(200,169,110,0.40);
+.legend-dot.pending  {
+    background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+    box-shadow: 0 0 8px rgba(245,158,11,0.40);
 }
 .legend-dot.taken     { background: var(--seat-taken); box-shadow: 0 0 8px rgba(239,68,68,0.35); }
 
@@ -1791,7 +2004,7 @@ body {
 <!-- ── Legend ── -->
 <div class="legend">
   <div class="legend-item"><div class="legend-dot available"></div> Available</div>
-  <div class="legend-item"><div class="legend-dot reserved"></div>  Your Allocation</div>
+    <div class="legend-item"><div class="legend-dot pending"></div>  Pending Confirmation</div>
   <div class="legend-item"><div class="legend-dot taken"></div>     Occupied</div>
 </div>
 
@@ -1924,23 +2137,25 @@ function syncButtons(seatsData, compsData) {
         const id   = parseInt(btn.dataset.seatId);
         const seat = seatMap[id];
         if (!seat) return;
-        applyButtonState(btn, seat.status, seat.reserved_by, 'seat');
+        applyButtonState(btn, seat.status, seat.reserved_by, seat.expires_at, 'seat');
     });
 
     document.querySelectorAll('.computer-button').forEach(btn => {
         const id   = parseInt(btn.dataset.computerId);
         const comp = compMap[id];
         if (!comp) return;
-        applyButtonState(btn, comp.status, comp.reserved_by, 'computer');
+        applyButtonState(btn, comp.status, comp.reserved_by, comp.expires_at, 'computer');
     });
 }
 
-function applyButtonState(btn, status, reservedBy, type) {
+function applyButtonState(btn, status, reservedBy, expiresAt, type) {
     const isMine  = (parseInt(reservedBy) === MY_USER);
     const isTaken = (status !== 'available' && !isMine);
+    const isPendingMine = isMine && !!expiresAt;
     const forceDisabled = (btn.dataset.forceDisabled === '1');
 
-    btn.classList.toggle('reserved-by-you', isMine);
+    btn.classList.toggle('reserved-by-you', isMine && !isPendingMine);
+    btn.classList.toggle('pending-confirmation', isPendingMine);
     btn.classList.toggle('taken',           isTaken);
 
     btn.disabled = forceDisabled || isTaken;
@@ -1948,6 +2163,10 @@ function applyButtonState(btn, status, reservedBy, type) {
 }
 
 let lastPollData = null;
+let pollTimer = null;
+const POLL_MS_ACTIVE = 2000;
+const POLL_MS_HIDDEN = 6000;
+
 function poll() {
     fetch(ENDPOINT + '?poll=1', { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
         .then(r => r.ok ? r.json() : null)
@@ -1963,7 +2182,16 @@ function poll() {
         })
         .catch(() => {});
 }
-setInterval(poll, 15000);
+
+function startPolling() {
+    if (pollTimer) clearInterval(pollTimer);
+    const interval = document.hidden ? POLL_MS_HIDDEN : POLL_MS_ACTIVE;
+    pollTimer = setInterval(poll, interval);
+}
+
+document.addEventListener('visibilitychange', startPolling);
+startPolling();
+poll();
 
 let pendingFormData = null;
 let pendingBtn      = null;
@@ -2008,11 +2236,13 @@ function doFetch(formData, btn) {
 
         if (data.success) {
             if (data.action === 'reserved') {
-                btn.classList.add('reserved-by-you');
+                const isPending = !!data.expires_at;
+                btn.classList.toggle('reserved-by-you', !isPending);
+                btn.classList.toggle('pending-confirmation', isPending);
                 btn.classList.remove('taken');
                 btn.dataset.action = 'release';
             } else {
-                btn.classList.remove('reserved-by-you', 'taken');
+                btn.classList.remove('reserved-by-you', 'pending-confirmation', 'taken');
                 btn.dataset.action = 'reserve';
                 btn.disabled = false;
             }
