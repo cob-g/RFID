@@ -8,6 +8,34 @@ session_start(); // ← Always first real statement after declare + ob_start
 
 include __DIR__ . '/db.php';
 
+function rfidLinkTableExists(mysqli $conn, string $table): bool
+{
+    $stmt = $conn->prepare(
+        'SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1'
+    );
+    $stmt->bind_param('s', $table);
+    $stmt->execute();
+    $stmt->bind_result($one);
+    $exists = $stmt->fetch();
+    $stmt->close();
+
+    return (bool) $exists;
+}
+
+function rfidLinkColumnExists(mysqli $conn, string $table, string $column): bool
+{
+    $stmt = $conn->prepare(
+        'SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ? LIMIT 1'
+    );
+    $stmt->bind_param('ss', $table, $column);
+    $stmt->execute();
+    $stmt->bind_result($one);
+    $exists = $stmt->fetch();
+    $stmt->close();
+
+    return (bool) $exists;
+}
+
 // ── Session guard ─────────────────────────────────────────────────────────────
 if (empty($_SESSION['rfid_pending_user_id'])) {
     session_write_close();
@@ -51,11 +79,19 @@ if ($user['status'] !== 'verified') {
 }
 
 // ── Status is 'verified': generate enrollment token ──────────────────────────
-// Delete stale tokens first (handles page-refresh case)
-$del = $conn->prepare("DELETE FROM pending_rfid_assignments WHERE user_id = ?");
-$del->bind_param('i', $userId);
-$del->execute();
-$del->close();
+$hasEnrollmentTokens = rfidLinkTableExists($conn, 'enrollment_tokens');
+$hasPendingAssignments = rfidLinkTableExists($conn, 'pending_rfid_assignments');
+
+if (!$hasEnrollmentTokens && !$hasPendingAssignments) {
+    error_log('[rfid_link] No enrollment token table found');
+    http_response_code(503);
+    echo '<!DOCTYPE html><html><body>'
+       . '<h2 style="font-family:sans-serif;color:#c00">Service Unavailable</h2>'
+       . '<p style="font-family:sans-serif">RFID enrollment is temporarily unavailable. '
+       . 'Please try again shortly.</p>'
+       . '</body></html>';
+    exit;
+}
 
 // 120-second window — more reliable on slow shared hosting than 60 s
 define('ENROLL_TTL', 120);
@@ -63,13 +99,74 @@ define('ENROLL_TTL', 120);
 $token     = bin2hex(random_bytes(32));  // 64 hex chars, cryptographically random
 $expiresAt = date('Y-m-d H:i:s', time() + ENROLL_TTL);
 
-$ins = $conn->prepare("
-    INSERT INTO pending_rfid_assignments (user_id, token, status, expires_at)
-    VALUES (?, ?, 'pending', ?)
-");
-$ins->bind_param('iss', $userId, $token, $expiresAt);
-$ins->execute();
-$ins->close();
+if ($hasEnrollmentTokens) {
+    // New schema flow: tokens keyed by user_id when supported.
+    $hasTokenUserId = rfidLinkColumnExists($conn, 'enrollment_tokens', 'user_id');
+    if ($hasTokenUserId) {
+        $del = $conn->prepare("DELETE FROM enrollment_tokens WHERE user_id = ?");
+        $del->bind_param('i', $userId);
+    } else {
+        $del = $conn->prepare("DELETE FROM enrollment_tokens WHERE user_name = ?");
+        $del->bind_param('s', $username);
+    }
+    $del->execute();
+    $del->close();
+
+    $hasStatus = rfidLinkColumnExists($conn, 'enrollment_tokens', 'status');
+    if ($hasTokenUserId && $hasStatus) {
+        $ins = $conn->prepare(
+            "INSERT INTO enrollment_tokens (user_id, user_name, token, expires_at, status) VALUES (?, ?, ?, ?, 'pending')"
+        );
+        $ins->bind_param('isss', $userId, $username, $token, $expiresAt);
+    } elseif ($hasTokenUserId) {
+        $ins = $conn->prepare(
+            "INSERT INTO enrollment_tokens (user_id, user_name, token, expires_at) VALUES (?, ?, ?, ?)"
+        );
+        $ins->bind_param('isss', $userId, $username, $token, $expiresAt);
+    } elseif ($hasStatus) {
+        $ins = $conn->prepare(
+            "INSERT INTO enrollment_tokens (user_name, token, expires_at, status) VALUES (?, ?, ?, 'pending')"
+        );
+        $ins->bind_param('sss', $username, $token, $expiresAt);
+    } else {
+        $ins = $conn->prepare(
+            "INSERT INTO enrollment_tokens (user_name, token, expires_at) VALUES (?, ?, ?)"
+        );
+        $ins->bind_param('sss', $username, $token, $expiresAt);
+    }
+    $ins->execute();
+    $ins->close();
+} else {
+    // Legacy schema flow: tokens keyed by user_id.
+    $del = $conn->prepare("DELETE FROM pending_rfid_assignments WHERE user_id = ?");
+    $del->bind_param('i', $userId);
+    $del->execute();
+    $del->close();
+
+    $hasStatus = rfidLinkColumnExists($conn, 'pending_rfid_assignments', 'status');
+    $hasFulfilled = rfidLinkColumnExists($conn, 'pending_rfid_assignments', 'fulfilled');
+
+    if ($hasStatus && $hasFulfilled) {
+        $ins = $conn->prepare(
+            "INSERT INTO pending_rfid_assignments (user_id, token, expires_at, status, fulfilled) VALUES (?, ?, ?, 'pending', 0)"
+        );
+    } elseif ($hasStatus) {
+        $ins = $conn->prepare(
+            "INSERT INTO pending_rfid_assignments (user_id, token, expires_at, status) VALUES (?, ?, ?, 'pending')"
+        );
+    } elseif ($hasFulfilled) {
+        $ins = $conn->prepare(
+            "INSERT INTO pending_rfid_assignments (user_id, token, expires_at, fulfilled) VALUES (?, ?, ?, 0)"
+        );
+    } else {
+        $ins = $conn->prepare(
+            "INSERT INTO pending_rfid_assignments (user_id, token, expires_at) VALUES (?, ?, ?)"
+        );
+    }
+    $ins->bind_param('iss', $userId, $token, $expiresAt);
+    $ins->execute();
+    $ins->close();
+}
 
 // Session is no longer needed for this page — release the lock so other
 // requests from the same browser (e.g. the poll) are not blocked.
@@ -345,7 +442,7 @@ session_write_close();
             if (done || secondsLeft <= 0) return;
             try {
                 const res = await fetch(
-                    `rfid_enroll_api.php?action=check&token=${encodeURIComponent(TOKEN)}`
+                    `enroll_api.php?action=check&token=${encodeURIComponent(TOKEN)}`
                 );
                 if (!res.ok) return;   // transient error — retry next tick
                 const data = await res.json();

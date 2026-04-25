@@ -8,379 +8,979 @@ header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, X-API-Key');
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(204); exit; }
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
+    http_response_code(204);
+    exit;
+}
 
 require_once __DIR__ . '/db.php';
 
-// ── Route ─────────────────────────────────────────────────────────────────────
-$method = $_SERVER['REQUEST_METHOD'];
-$data   = [];
-
-if ($method === 'GET') {
-    $action = trim($_GET['action'] ?? '');
-} else {
-    $raw    = (string) file_get_contents('php://input', false, null, 0, 8192);
-    $data   = json_decode($raw, true) ?? [];
-    $action = trim($data['action'] ?? '');
-}
-
-switch ($action) {
-    // ── ESP32 web-portal calls ───────────────────────────────────────────
-    case 'enroll':   handleDirectEnroll($conn, $data);    break; // portal: add card
-    case 'delete':   handleDirectDelete($conn, $data);    break; // portal: remove card
-    case 'list':     handleList($conn);                   break; // portal: list cards
-
-    // ── Remote-tap-to-link calls (existing flow, bug-fixed) ─────────────
-    case 'request':  handleRequest($conn, $data);         break; // web: create token
-    case 'poll':     handlePoll($conn);                   break; // ESP32: any pending?
-    case 'submit':   handleSubmit($conn, $data);          break; // ESP32: submit UID
-    case 'check':    handleCheck($conn);                  break; // browser: done yet?
-
-    default:
-        http_response_code(400);
-        echo json_encode(['status' => 'error', 'msg' => 'Unknown or missing action']);
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  HELPERS
-// ════════════════════════════════════════════════════════════════════════════
-
-function checkKey(array $data): bool
+function enrollApiRespond(array $payload, int $statusCode = 200): void
 {
-    $k = (string) ($data['api_key'] ?? ($_SERVER['HTTP_X_API_KEY'] ?? ''));
-    return hash_equals(API_KEY, $k);
+    http_response_code($statusCode);
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 }
 
-function checkKeyGet(): bool
+function enrollApiCheckKey(array $data): bool
 {
-    $k = (string) ($_GET['api_key'] ?? ($_SERVER['HTTP_X_API_KEY'] ?? ''));
-    return hash_equals(API_KEY, $k);
+    $provided = (string) ($data['api_key'] ?? ($_SERVER['HTTP_X_API_KEY'] ?? ''));
+    return hash_equals(API_KEY, $provided);
 }
 
-function validUid(string $uid): bool
+function enrollApiCheckKeyGet(array $query): bool
+{
+    $provided = (string) ($query['api_key'] ?? ($_SERVER['HTTP_X_API_KEY'] ?? ''));
+    return hash_equals(API_KEY, $provided);
+}
+
+function enrollApiValidUid(string $uid): bool
 {
     return (bool) preg_match('/^[0-9A-F]{2}(:[0-9A-F]{2}){3}$/', $uid);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  A. DIRECT ENROLL — ESP32 web portal: POST {action,api_key,name,uid}
-//     This is the NEW action that connects your ESP32 portal directly to MySQL.
-// ════════════════════════════════════════════════════════════════════════════
-function handleDirectEnroll(mysqli $conn, array $data): void
+function enrollApiTableExists(mysqli $conn, string $table): bool
 {
-    if (!checkKey($data)) {
-        http_response_code(401);
-        echo json_encode(['status' => 'error', 'msg' => 'Invalid API key']);
-        return;
+    static $cache = [];
+    if (array_key_exists($table, $cache)) {
+        return $cache[$table];
     }
 
-    $name = substr(trim((string) ($data['name'] ?? '')), 0, 100);
-    $uid  = strtoupper(trim((string) ($data['uid']  ?? '')));
-
-    if ($name === '' || $uid === '') {
-        http_response_code(400);
-        echo json_encode(['status' => 'error', 'msg' => 'name and uid are required']);
-        return;
-    }
-    if (!validUid($uid)) {
-        http_response_code(400);
-        echo json_encode(['status' => 'error', 'msg' => 'UID must be AA:BB:CC:DD']);
-        return;
-    }
-
-    // Duplicate UID check
     $stmt = $conn->prepare(
-        "SELECT id, name FROM rfid_cards WHERE uid = ? LIMIT 1"
+        'SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1'
     );
-    $stmt->bind_param('s', $uid);
+    $stmt->bind_param('s', $table);
     $stmt->execute();
-    $stmt->bind_result($existId, $existName);
+    $stmt->bind_result($one);
     $exists = $stmt->fetch();
     $stmt->close();
 
-    if ($exists) {
-        echo json_encode([
+    $cache[$table] = (bool) $exists;
+    return $cache[$table];
+}
+
+function enrollApiColumnExists(mysqli $conn, string $table, string $column): bool
+{
+    static $cache = [];
+    $key = $table . '.' . $column;
+    if (array_key_exists($key, $cache)) {
+        return $cache[$key];
+    }
+
+    $stmt = $conn->prepare(
+        'SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ? LIMIT 1'
+    );
+    $stmt->bind_param('ss', $table, $column);
+    $stmt->execute();
+    $stmt->bind_result($one);
+    $exists = $stmt->fetch();
+    $stmt->close();
+
+    $cache[$key] = (bool) $exists;
+    return $cache[$key];
+}
+
+function enrollApiSchema(mysqli $conn): array
+{
+    static $schema = null;
+    if ($schema !== null) {
+        return $schema;
+    }
+
+    $schema = [
+        'has_rfid_cards' => enrollApiTableExists($conn, 'rfid_cards'),
+        'has_rfid_devices' => enrollApiTableExists($conn, 'rfid_devices'),
+        'has_enrollment_tokens' => enrollApiTableExists($conn, 'enrollment_tokens'),
+        'has_pending_assignments' => enrollApiTableExists($conn, 'pending_rfid_assignments'),
+    ];
+
+    $schema['rfid_cards_has_status'] = $schema['has_rfid_cards']
+        ? enrollApiColumnExists($conn, 'rfid_cards', 'status')
+        : false;
+    $schema['rfid_cards_has_user_id'] = $schema['has_rfid_cards']
+        ? enrollApiColumnExists($conn, 'rfid_cards', 'user_id')
+        : false;
+    $schema['rfid_cards_has_enrolled_at'] = $schema['has_rfid_cards']
+        ? enrollApiColumnExists($conn, 'rfid_cards', 'enrolled_at')
+        : false;
+    $schema['rfid_cards_has_created_at'] = $schema['has_rfid_cards']
+        ? enrollApiColumnExists($conn, 'rfid_cards', 'created_at')
+        : false;
+
+    $schema['rfid_devices_has_status'] = $schema['has_rfid_devices']
+        ? enrollApiColumnExists($conn, 'rfid_devices', 'status')
+        : false;
+    $schema['rfid_devices_has_created_at'] = $schema['has_rfid_devices']
+        ? enrollApiColumnExists($conn, 'rfid_devices', 'created_at')
+        : false;
+
+    $schema['enrollment_has_status'] = $schema['has_enrollment_tokens']
+        ? enrollApiColumnExists($conn, 'enrollment_tokens', 'status')
+        : false;
+    $schema['enrollment_has_user_id'] = $schema['has_enrollment_tokens']
+        ? enrollApiColumnExists($conn, 'enrollment_tokens', 'user_id')
+        : false;
+    $schema['enrollment_has_created_at'] = $schema['has_enrollment_tokens']
+        ? enrollApiColumnExists($conn, 'enrollment_tokens', 'created_at')
+        : false;
+
+    $schema['pending_has_status'] = $schema['has_pending_assignments']
+        ? enrollApiColumnExists($conn, 'pending_rfid_assignments', 'status')
+        : false;
+    $schema['pending_has_fulfilled'] = $schema['has_pending_assignments']
+        ? enrollApiColumnExists($conn, 'pending_rfid_assignments', 'fulfilled')
+        : false;
+    $schema['pending_has_created_at'] = $schema['has_pending_assignments']
+        ? enrollApiColumnExists($conn, 'pending_rfid_assignments', 'created_at')
+        : false;
+
+    return $schema;
+}
+
+function enrollApiFindUserByUsername(mysqli $conn, string $username): ?array
+{
+    static $cache = [];
+    $username = trim($username);
+    if ($username === '') {
+        return null;
+    }
+
+    if (array_key_exists($username, $cache)) {
+        return $cache[$username];
+    }
+
+    $stmt = $conn->prepare('SELECT id, username FROM users WHERE username = ? LIMIT 1');
+    $stmt->bind_param('s', $username);
+    $stmt->execute();
+    $stmt->bind_result($userId, $canonicalUsername);
+    $found = $stmt->fetch();
+    $stmt->close();
+
+    $cache[$username] = $found
+        ? ['id' => (int) $userId, 'username' => (string) $canonicalUsername]
+        : null;
+
+    return $cache[$username];
+}
+
+function enrollApiExpireTokens(mysqli $conn, array $schema): void
+{
+    if ($schema['has_enrollment_tokens'] && $schema['enrollment_has_status']) {
+        $conn->query(
+            "UPDATE enrollment_tokens SET status='expired' WHERE status='pending' AND expires_at < NOW()"
+        );
+    }
+
+    if ($schema['has_pending_assignments'] && $schema['pending_has_status']) {
+        $conn->query(
+            "UPDATE pending_rfid_assignments SET status='expired' WHERE status='pending' AND expires_at < NOW()"
+        );
+    }
+}
+
+function enrollApiFindToken(mysqli $conn, string $token, array $schema): ?array
+{
+    if ($schema['has_enrollment_tokens']) {
+        $userIdExpr = $schema['enrollment_has_user_id'] ? 'user_id' : 'NULL AS user_id';
+        $statusExpr = $schema['enrollment_has_status'] ? 'status' : "'pending' AS status";
+        $stmt = $conn->prepare(
+            "SELECT id, user_name, {$userIdExpr}, {$statusExpr}, expires_at
+             FROM enrollment_tokens
+             WHERE token=?
+             LIMIT 1"
+        );
+        $stmt->bind_param('s', $token);
+        $stmt->execute();
+        $stmt->bind_result($id, $userName, $userId, $status, $expiresAt);
+        $found = $stmt->fetch();
+        $stmt->close();
+
+        if ($found) {
+            return [
+                'source' => 'enrollment_tokens',
+                'id' => (int) $id,
+                'user_id' => $userId !== null ? (int) $userId : null,
+                'user_name' => (string) $userName,
+                'status' => strtolower((string) $status),
+                'fulfilled' => 0,
+                'expires_at' => (string) $expiresAt,
+            ];
+        }
+    }
+
+    if ($schema['has_pending_assignments']) {
+        $statusExpr = $schema['pending_has_status'] ? 'p.status' : "'pending'";
+        $fulfilledExpr = $schema['pending_has_fulfilled'] ? 'p.fulfilled' : '0';
+        $stmt = $conn->prepare(
+            "SELECT p.id,
+                    p.user_id,
+                    COALESCE(u.username, CONCAT('User #', p.user_id)) AS user_name,
+                    {$statusExpr} AS status,
+                    {$fulfilledExpr} AS fulfilled,
+                    p.expires_at
+             FROM pending_rfid_assignments p
+             LEFT JOIN users u ON u.id = p.user_id
+             WHERE p.token = ?
+             LIMIT 1"
+        );
+        $stmt->bind_param('s', $token);
+        $stmt->execute();
+        $stmt->bind_result($id, $userId, $userName, $status, $fulfilled, $expiresAt);
+        $found = $stmt->fetch();
+        $stmt->close();
+
+        if ($found) {
+            return [
+                'source' => 'pending_rfid_assignments',
+                'id' => (int) $id,
+                'user_id' => (int) $userId,
+                'user_name' => (string) $userName,
+                'status' => strtolower((string) $status),
+                'fulfilled' => (int) $fulfilled,
+                'expires_at' => (string) $expiresAt,
+            ];
+        }
+    }
+
+    return null;
+}
+
+function enrollApiNormalizedTokenStatus(array $token): string
+{
+    $status = strtolower((string) ($token['status'] ?? 'pending'));
+    if ($status === 'fulfilled' || (int) ($token['fulfilled'] ?? 0) === 1) {
+        return 'fulfilled';
+    }
+
+    if ($status === 'expired') {
+        return 'expired';
+    }
+
+    $expiresAt = (string) ($token['expires_at'] ?? '');
+    if ($expiresAt !== '' && strtotime($expiresAt) < time()) {
+        return 'expired';
+    }
+
+    return 'pending';
+}
+
+function enrollApiMarkTokenExpired(mysqli $conn, array $token, array $schema): void
+{
+    if ($token['source'] === 'enrollment_tokens') {
+        if ($schema['enrollment_has_status']) {
+            $stmt = $conn->prepare("UPDATE enrollment_tokens SET status='expired' WHERE id=?");
+            $stmt->bind_param('i', $token['id']);
+            $stmt->execute();
+            $stmt->close();
+        }
+        return;
+    }
+
+    $updates = [];
+    if ($schema['pending_has_status']) {
+        $updates[] = "status='expired'";
+    }
+    if (!$updates) {
+        return;
+    }
+
+    $sql = 'UPDATE pending_rfid_assignments SET ' . implode(', ', $updates) . ' WHERE id=?';
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param('i', $token['id']);
+    $stmt->execute();
+    $stmt->close();
+}
+
+function enrollApiMarkTokenFulfilled(mysqli $conn, array $token, array $schema): void
+{
+    if ($token['source'] === 'enrollment_tokens') {
+        if ($schema['enrollment_has_status']) {
+            $stmt = $conn->prepare("UPDATE enrollment_tokens SET status='fulfilled' WHERE id=?");
+            $stmt->bind_param('i', $token['id']);
+            $stmt->execute();
+            $stmt->close();
+        }
+        return;
+    }
+
+    $updates = [];
+    if ($schema['pending_has_status']) {
+        $updates[] = "status='fulfilled'";
+    }
+    if ($schema['pending_has_fulfilled']) {
+        $updates[] = 'fulfilled=1';
+    }
+    if (!$updates) {
+        return;
+    }
+
+    $sql = 'UPDATE pending_rfid_assignments SET ' . implode(', ', $updates) . ' WHERE id=?';
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param('i', $token['id']);
+    $stmt->execute();
+    $stmt->close();
+}
+
+function enrollApiUidExists(mysqli $conn, string $uid, array $schema): bool
+{
+    if ($schema['has_rfid_cards']) {
+        $sql = $schema['rfid_cards_has_status']
+            ? "SELECT id FROM rfid_cards WHERE uid=? AND status='active' LIMIT 1"
+            : 'SELECT id FROM rfid_cards WHERE uid=? LIMIT 1';
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param('s', $uid);
+        $stmt->execute();
+        $stmt->store_result();
+        $exists = $stmt->num_rows > 0;
+        $stmt->close();
+        if ($exists) {
+            return true;
+        }
+    }
+
+    if ($schema['has_rfid_devices']) {
+        $sql = $schema['rfid_devices_has_status']
+            ? "SELECT id FROM rfid_devices WHERE uid=? AND status='active' LIMIT 1"
+            : 'SELECT id FROM rfid_devices WHERE uid=? LIMIT 1';
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param('s', $uid);
+        $stmt->execute();
+        $stmt->store_result();
+        $exists = $stmt->num_rows > 0;
+        $stmt->close();
+        if ($exists) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function enrollApiUserHasActiveCard(mysqli $conn, int $userId, array $schema): bool
+{
+    if ($schema['has_rfid_cards'] && $schema['rfid_cards_has_user_id']) {
+        $sql = $schema['rfid_cards_has_status']
+            ? "SELECT id FROM rfid_cards WHERE user_id=? AND status='active' LIMIT 1"
+            : 'SELECT id FROM rfid_cards WHERE user_id=? LIMIT 1';
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param('i', $userId);
+        $stmt->execute();
+        $stmt->store_result();
+        $exists = $stmt->num_rows > 0;
+        $stmt->close();
+        if ($exists) {
+            return true;
+        }
+    }
+
+    if ($schema['has_rfid_devices']) {
+        $sql = $schema['rfid_devices_has_status']
+            ? "SELECT id FROM rfid_devices WHERE user_id=? AND status='active' LIMIT 1"
+            : 'SELECT id FROM rfid_devices WHERE user_id=? LIMIT 1';
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param('i', $userId);
+        $stmt->execute();
+        $stmt->store_result();
+        $exists = $stmt->num_rows > 0;
+        $stmt->close();
+        if ($exists) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function enrollApiInsertCardMapping(mysqli $conn, array $schema, int $userId, string $userName, string $uid): int
+{
+    if ($schema['has_rfid_cards']) {
+        if (!$schema['rfid_cards_has_user_id']) {
+            throw new RuntimeException('rfid_cards.user_id column is required for account-bound enrollment');
+        }
+
+        if ($schema['rfid_cards_has_status']) {
+            $ins = $conn->prepare(
+                "INSERT INTO rfid_cards (name, uid, user_id, status) VALUES (?, ?, ?, 'active')"
+            );
+        } else {
+            $ins = $conn->prepare('INSERT INTO rfid_cards (name, uid, user_id) VALUES (?, ?, ?)');
+        }
+        $ins->bind_param('ssi', $userName, $uid, $userId);
+        $ins->execute();
+        $newId = (int) $ins->insert_id;
+        $ins->close();
+
+        return $newId;
+    }
+
+    if ($schema['has_rfid_devices']) {
+        if ($schema['rfid_devices_has_status']) {
+            $ins = $conn->prepare("INSERT INTO rfid_devices (uid, user_id, status) VALUES (?, ?, 'active')");
+        } else {
+            $ins = $conn->prepare('INSERT INTO rfid_devices (uid, user_id) VALUES (?, ?)');
+        }
+        $ins->bind_param('si', $uid, $userId);
+        $ins->execute();
+        $newId = (int) $ins->insert_id;
+        $ins->close();
+
+        return $newId;
+    }
+
+    throw new RuntimeException('RFID mapping tables are not configured');
+}
+
+function enrollApiHandleDirectEnroll(mysqli $conn, array $body): void
+{
+    if (!enrollApiCheckKey($body)) {
+        enrollApiRespond(['status' => 'error', 'msg' => 'Invalid API key'], 401);
+        return;
+    }
+
+    $name = substr(trim((string) ($body['name'] ?? '')), 0, 100);
+    $uid = strtoupper(trim((string) ($body['uid'] ?? '')));
+
+    if ($name === '' || $uid === '') {
+        enrollApiRespond(['status' => 'error', 'msg' => 'name and uid are required'], 400);
+        return;
+    }
+    if (!enrollApiValidUid($uid)) {
+        enrollApiRespond(['status' => 'error', 'msg' => 'UID must be AA:BB:CC:DD'], 400);
+        return;
+    }
+
+    $user = enrollApiFindUserByUsername($conn, $name);
+    if (!$user) {
+        enrollApiRespond(['status' => 'not_found', 'msg' => 'Student account not found'], 404);
+        return;
+    }
+
+    $userId = (int) $user['id'];
+    $userName = (string) $user['username'];
+
+    $schema = enrollApiSchema($conn);
+
+    if (enrollApiUidExists($conn, $uid, $schema)) {
+        enrollApiRespond([
             'status' => 'duplicate',
-            'msg'    => 'Card already registered to: ' . $existName,
+            'msg' => 'Card already registered to another student',
         ]);
         return;
     }
 
-    $stmt = $conn->prepare(
-        "INSERT INTO rfid_cards (name, uid) VALUES (?, ?)"
-    );
-    $stmt->bind_param('ss', $name, $uid);
-    $stmt->execute();
-    $newId = $stmt->insert_id;
-    $stmt->close();
-
-    echo json_encode([
-        'status'  => 'ok',
-        'msg'     => $name . ' enrolled successfully',
-        'card_id' => $newId,
-        'name'    => $name,
-        'uid'     => $uid,
-    ]);
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  B. DIRECT DELETE — ESP32 web portal: POST {action,api_key,name}
-// ════════════════════════════════════════════════════════════════════════════
-function handleDirectDelete(mysqli $conn, array $data): void
-{
-    if (!checkKey($data)) {
-        http_response_code(401);
-        echo json_encode(['status' => 'error', 'msg' => 'Invalid API key']);
+    if (enrollApiUserHasActiveCard($conn, $userId, $schema)) {
+        enrollApiRespond([
+            'status' => 'duplicate_user',
+            'msg' => 'This account already has an active RFID card',
+        ]);
         return;
     }
 
-    $name = trim((string) ($data['name'] ?? ''));
-    if ($name === '') {
-        http_response_code(400);
-        echo json_encode(['status' => 'error', 'msg' => 'name is required']);
-        return;
-    }
-
-    $stmt = $conn->prepare("DELETE FROM rfid_cards WHERE name = ? LIMIT 1");
-    $stmt->bind_param('s', $name);
-    $stmt->execute();
-    $deleted = $stmt->affected_rows;
-    $stmt->close();
-
-    echo json_encode([
-        'status' => $deleted > 0 ? 'ok' : 'not_found',
-        'msg'    => $deleted > 0 ? $name . ' deleted' : 'Student not found',
-    ]);
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  C. LIST — GET ?action=list&api_key=...  (for ESP32 portal student table)
-// ════════════════════════════════════════════════════════════════════════════
-function handleList(mysqli $conn): void
-{
-    if (!checkKeyGet()) {
-        http_response_code(401);
-        echo json_encode(['status' => 'error', 'msg' => 'Invalid API key']);
-        return;
-    }
-
-    $result = $conn->query(
-        "SELECT id, name, uid, enrolled_at
-         FROM rfid_cards WHERE status='active' ORDER BY name ASC"
-    );
-    $cards = [];
-    while ($row = $result->fetch_assoc()) $cards[] = $row;
-
-    echo json_encode(['status' => 'ok', 'cards' => $cards, 'count' => count($cards)]);
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  D. REQUEST — Web portal: POST {action,name} → create enrollment token
-//     Called by rfid_link.php (or any web page) to begin remote tap flow.
-// ════════════════════════════════════════════════════════════════════════════
-function handleRequest(mysqli $conn, array $data): void
-{
-    // No API key required here — called server-side from your PHP session pages.
-    // Add a session/CSRF check if this endpoint is publicly reachable.
-    $name = substr(trim((string) ($data['name'] ?? '')), 0, 100);
-    if ($name === '') {
-        http_response_code(400);
-        echo json_encode(['status' => 'error', 'msg' => 'name is required']);
-        return;
-    }
-
-    // Clean up any stale pending token for this user
-    $del = $conn->prepare("DELETE FROM enrollment_tokens WHERE user_name = ?");
-    $del->bind_param('s', $name);
-    $del->execute();
-    $del->close();
-
-    $token     = bin2hex(random_bytes(32));              // 64 hex chars
-    $expiresAt = date('Y-m-d H:i:s', time() + 120);     // 2-minute window
-
-    $ins = $conn->prepare(
-        "INSERT INTO enrollment_tokens (user_name, token, expires_at) VALUES (?,?,?)"
-    );
-    $ins->bind_param('sss', $name, $token, $expiresAt);
-    $ins->execute();
-    $ins->close();
-
-    echo json_encode(['status' => 'ok', 'token' => $token, 'expires_in' => 120]);
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  E. POLL — ESP32: GET ?action=poll&api_key=...
-//     "Is there a pending remote enrollment waiting for a card tap?"
-// ════════════════════════════════════════════════════════════════════════════
-function handlePoll(mysqli $conn): void
-{
-    if (!checkKeyGet()) {
-        http_response_code(401);
-        echo json_encode(['status' => 'error', 'msg' => 'Invalid API key']);
-        return;
-    }
-
-    // Sweep expired tokens
-    $conn->query(
-        "UPDATE enrollment_tokens SET status='expired'
-         WHERE status='pending' AND expires_at < NOW()"
-    );
-
-    $stmt = $conn->prepare("
-        SELECT token, user_name,
-               GREATEST(0, TIMESTAMPDIFF(SECOND, NOW(), expires_at)) AS secs_left
-        FROM   enrollment_tokens
-        WHERE  status='pending' AND expires_at > NOW()
-        ORDER  BY created_at ASC
-        LIMIT  1
-    ");
-    $stmt->execute();
-    $stmt->bind_result($token, $userName, $secsLeft);
-    $found = $stmt->fetch();
-    $stmt->close();
-
-    if (!$found) {
-        echo json_encode(['pending' => false]);
-        return;
-    }
-
-    echo json_encode([
-        'pending'    => true,
-        'token'      => $token,
-        'username'   => $userName,
-        'expires_in' => max(5, min(300, (int) $secsLeft)),
-    ]);
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  F. SUBMIT — ESP32: POST {action,api_key,token,uid}
-//     Card was tapped; link it to the pending enrollment token.
-// ════════════════════════════════════════════════════════════════════════════
-function handleSubmit(mysqli $conn, array $data): void
-{
-    if (!checkKey($data)) {
-        http_response_code(401);
-        echo json_encode(['status' => 'error', 'msg' => 'Invalid API key']);
-        return;
-    }
-
-    $token = trim((string) ($data['token'] ?? ''));
-    $uid   = strtoupper(trim((string) ($data['uid']   ?? '')));
-
-    if ($token === '' || $uid === '') {
-        http_response_code(400);
-        echo json_encode(['status' => 'error', 'msg' => 'token and uid are required']);
-        return;
-    }
-    if (!preg_match('/^[0-9a-f]{64}$/', $token)) {
-        http_response_code(400);
-        echo json_encode(['status' => 'error', 'msg' => 'Invalid token format']);
-        return;
-    }
-    if (!validUid($uid)) {
-        http_response_code(400);
-        echo json_encode(['status' => 'error', 'msg' => 'UID must be AA:BB:CC:DD']);
-        return;
-    }
-
-    // Sweep expired
-    $conn->query(
-        "UPDATE enrollment_tokens SET status='expired'
-         WHERE status='pending' AND expires_at < NOW()"
-    );
-
-    $stmt = $conn->prepare(
-        "SELECT id, user_name, status, expires_at FROM enrollment_tokens WHERE token=? LIMIT 1"
-    );
-    $stmt->bind_param('s', $token);
-    $stmt->execute();
-    $stmt->bind_result($tokenId, $userName, $tokenStatus, $expiresAt);
-    $found = $stmt->fetch();
-    $stmt->close();
-
-    if (!$found) {
-        echo json_encode(['status' => 'error', 'msg' => 'Token not found']);
-        return;
-    }
-    if ($tokenStatus === 'fulfilled') {
-        echo json_encode(['status' => 'duplicate', 'msg' => 'Token already used']);
-        return;
-    }
-    if ($tokenStatus === 'expired' || strtotime($expiresAt) < time()) {
-        $conn->query("UPDATE enrollment_tokens SET status='expired' WHERE id=" . (int) $tokenId);
-        echo json_encode(['status' => 'expired', 'msg' => 'Enrollment window expired — try again']);
-        return;
-    }
-
-    // UID already registered?
-    $s = $conn->prepare(
-        "SELECT id FROM rfid_cards WHERE uid=? AND status='active' LIMIT 1"
-    );
-    $s->bind_param('s', $uid);
-    $s->execute();
-    $s->store_result();
-    $isDup = $s->num_rows > 0;
-    $s->close();
-
-    if ($isDup) {
-        echo json_encode(['status' => 'duplicate', 'msg' => 'Card already registered to another student']);
-        return;
-    }
-
-    // Atomic: insert card + mark token fulfilled
     try {
-        $conn->begin_transaction();
+        $newId = enrollApiInsertCardMapping($conn, $schema, $userId, $userName, $uid);
+    } catch (Throwable $e) {
+        error_log('[enroll_api/direct_enroll] ' . $e->getMessage());
+        enrollApiRespond(['status' => 'error', 'msg' => 'RFID mapping schema is not ready'], 500);
+        return;
+    }
 
-        $ins = $conn->prepare("INSERT INTO rfid_cards (name, uid) VALUES (?, ?)");
-        $ins->bind_param('ss', $userName, $uid);
+    enrollApiRespond([
+        'status' => 'ok',
+        'msg' => $userName . ' enrolled successfully',
+        'card_id' => $newId,
+        'name' => $userName,
+        'uid' => $uid,
+    ]);
+}
+
+function enrollApiHandleDirectDelete(mysqli $conn, array $body): void
+{
+    if (!enrollApiCheckKey($body)) {
+        enrollApiRespond(['status' => 'error', 'msg' => 'Invalid API key'], 401);
+        return;
+    }
+
+    $name = trim((string) ($body['name'] ?? ''));
+    if ($name === '') {
+        enrollApiRespond(['status' => 'error', 'msg' => 'name is required'], 400);
+        return;
+    }
+
+    $user = enrollApiFindUserByUsername($conn, $name);
+    if (!$user) {
+        enrollApiRespond(['status' => 'not_found', 'msg' => 'Student account not found'], 404);
+        return;
+    }
+
+    $userId = (int) $user['id'];
+    $schema = enrollApiSchema($conn);
+    $deleted = 0;
+
+    if ($schema['has_rfid_cards']) {
+        if ($schema['rfid_cards_has_user_id']) {
+            $stmt = $conn->prepare('DELETE FROM rfid_cards WHERE user_id = ? LIMIT 1');
+            $stmt->bind_param('i', $userId);
+        } else {
+            $stmt = $conn->prepare('DELETE FROM rfid_cards WHERE name = ? LIMIT 1');
+            $stmt->bind_param('s', $name);
+        }
+        $stmt->execute();
+        $deleted += max(0, $stmt->affected_rows);
+        $stmt->close();
+    }
+
+    if ($schema['has_rfid_devices']) {
+        $stmt = $conn->prepare('DELETE FROM rfid_devices WHERE user_id = ? LIMIT 1');
+        $stmt->bind_param('i', $userId);
+        $stmt->execute();
+        $deleted += max(0, $stmt->affected_rows);
+        $stmt->close();
+    }
+
+    enrollApiRespond([
+        'status' => $deleted > 0 ? 'ok' : 'not_found',
+        'msg' => $deleted > 0 ? $name . ' deleted' : 'Student not found',
+    ]);
+}
+
+function enrollApiHandleList(mysqli $conn, array $query, array $body): void
+{
+    $keyData = $body ?: $query;
+    if (!enrollApiCheckKey($keyData) && !enrollApiCheckKeyGet($query)) {
+        enrollApiRespond(['status' => 'error', 'msg' => 'Invalid API key'], 401);
+        return;
+    }
+
+    $schema = enrollApiSchema($conn);
+    $cards = [];
+    $seenUids = [];
+
+    if ($schema['has_rfid_cards']) {
+        if ($schema['rfid_cards_has_user_id']) {
+            $where = $schema['rfid_cards_has_status'] ? " WHERE c.status='active'" : '';
+            $enrolledExpr = 'NULL AS enrolled_at';
+            if ($schema['rfid_cards_has_enrolled_at']) {
+                $enrolledExpr = 'c.enrolled_at';
+            } elseif ($schema['rfid_cards_has_created_at']) {
+                $enrolledExpr = 'c.created_at AS enrolled_at';
+            }
+
+            $sql = "SELECT c.id,
+                           COALESCE(u.username, c.name, CONCAT('User #', c.user_id)) AS name,
+                           c.uid,
+                           {$enrolledExpr}
+                    FROM rfid_cards c
+                    LEFT JOIN users u ON u.id = c.user_id
+                    {$where}
+                    ORDER BY name ASC";
+        } else {
+            $where = $schema['rfid_cards_has_status'] ? " WHERE status='active'" : '';
+            $enrolledExpr = 'NULL AS enrolled_at';
+            if ($schema['rfid_cards_has_enrolled_at']) {
+                $enrolledExpr = 'enrolled_at';
+            } elseif ($schema['rfid_cards_has_created_at']) {
+                $enrolledExpr = 'created_at AS enrolled_at';
+            }
+
+            $sql = "SELECT id, name, uid, {$enrolledExpr} FROM rfid_cards{$where} ORDER BY name ASC";
+        }
+
+        $res = $conn->query($sql);
+        while ($row = $res->fetch_assoc()) {
+            $uid = strtoupper(trim((string) ($row['uid'] ?? '')));
+            if ($uid !== '') {
+                $seenUids[$uid] = true;
+            }
+            $cards[] = [
+                'id' => (int) ($row['id'] ?? 0),
+                'name' => (string) ($row['name'] ?? ''),
+                'uid' => $uid,
+                'enrolled_at' => $row['enrolled_at'] ?? null,
+            ];
+        }
+    }
+
+    if ($schema['has_rfid_devices']) {
+        $where = [];
+        if ($schema['rfid_devices_has_status']) {
+            $where[] = "d.status='active'";
+        }
+        $whereSql = $where ? (' WHERE ' . implode(' AND ', $where)) : '';
+
+        $enrolledExpr = $schema['rfid_devices_has_created_at']
+            ? 'd.created_at AS enrolled_at'
+            : 'NULL AS enrolled_at';
+
+        $sql = "SELECT d.id,
+                       COALESCE(u.username, CONCAT('User #', d.user_id)) AS name,
+                       d.uid,
+                       {$enrolledExpr}
+                FROM rfid_devices d
+                LEFT JOIN users u ON u.id = d.user_id
+                {$whereSql}
+                ORDER BY name ASC";
+        $res = $conn->query($sql);
+        while ($row = $res->fetch_assoc()) {
+            $uid = strtoupper(trim((string) ($row['uid'] ?? '')));
+            if ($uid !== '' && isset($seenUids[$uid])) {
+                continue;
+            }
+            $cards[] = [
+                'id' => (int) ($row['id'] ?? 0),
+                'name' => (string) ($row['name'] ?? ''),
+                'uid' => $uid,
+                'enrolled_at' => $row['enrolled_at'] ?? null,
+            ];
+        }
+    }
+
+    usort($cards, static fn(array $a, array $b): int => strcasecmp((string) $a['name'], (string) $b['name']));
+
+    enrollApiRespond(['status' => 'ok', 'cards' => $cards, 'count' => count($cards)]);
+}
+
+function enrollApiHandleRequestToken(mysqli $conn, array $body): void
+{
+    $name = substr(trim((string) ($body['name'] ?? '')), 0, 100);
+    if ($name === '') {
+        enrollApiRespond(['status' => 'error', 'msg' => 'name is required'], 400);
+        return;
+    }
+
+    $user = enrollApiFindUserByUsername($conn, $name);
+    if (!$user) {
+        enrollApiRespond(['status' => 'not_found', 'msg' => 'Student account not found'], 404);
+        return;
+    }
+
+    $userId = (int) $user['id'];
+    $userName = (string) $user['username'];
+
+    $token = bin2hex(random_bytes(32));
+    $expiresAt = date('Y-m-d H:i:s', time() + 120);
+    $schema = enrollApiSchema($conn);
+
+    if ($schema['has_enrollment_tokens']) {
+        if ($schema['enrollment_has_user_id']) {
+            $del = $conn->prepare('DELETE FROM enrollment_tokens WHERE user_id = ?');
+            $del->bind_param('i', $userId);
+        } else {
+            $del = $conn->prepare('DELETE FROM enrollment_tokens WHERE user_name = ?');
+            $del->bind_param('s', $userName);
+        }
+        $del->execute();
+        $del->close();
+
+        if ($schema['enrollment_has_user_id'] && $schema['enrollment_has_status']) {
+            $ins = $conn->prepare(
+                "INSERT INTO enrollment_tokens (user_id, user_name, token, expires_at, status)
+                 VALUES (?, ?, ?, ?, 'pending')"
+            );
+            $ins->bind_param('isss', $userId, $userName, $token, $expiresAt);
+        } elseif ($schema['enrollment_has_user_id']) {
+            $ins = $conn->prepare(
+                'INSERT INTO enrollment_tokens (user_id, user_name, token, expires_at) VALUES (?, ?, ?, ?)'
+            );
+            $ins->bind_param('isss', $userId, $userName, $token, $expiresAt);
+        } elseif ($schema['enrollment_has_status']) {
+            $ins = $conn->prepare(
+                "INSERT INTO enrollment_tokens (user_name, token, expires_at, status) VALUES (?, ?, ?, 'pending')"
+            );
+            $ins->bind_param('sss', $userName, $token, $expiresAt);
+        } else {
+            $ins = $conn->prepare('INSERT INTO enrollment_tokens (user_name, token, expires_at) VALUES (?, ?, ?)');
+            $ins->bind_param('sss', $userName, $token, $expiresAt);
+        }
         $ins->execute();
         $ins->close();
 
-        $upd = $conn->prepare("UPDATE enrollment_tokens SET status='fulfilled' WHERE id=?");
-        $upd->bind_param('i', $tokenId);
-        $upd->execute();
-        $upd->close();
-
-        $conn->commit();
-    } catch (Exception $e) {
-        $conn->rollback();
-        error_log('[enroll_api/submit] ' . $e->getMessage());
-        http_response_code(500);
-        echo json_encode(['status' => 'error', 'msg' => 'Database error — please try again']);
+        enrollApiRespond(['status' => 'ok', 'token' => $token, 'expires_in' => 120]);
         return;
     }
 
-    echo json_encode([
+    if ($schema['has_pending_assignments']) {
+        $del = $conn->prepare('DELETE FROM pending_rfid_assignments WHERE user_id = ?');
+        $del->bind_param('i', $userId);
+        $del->execute();
+        $del->close();
+
+        if ($schema['pending_has_status'] && $schema['pending_has_fulfilled']) {
+            $ins = $conn->prepare("INSERT INTO pending_rfid_assignments (user_id, token, expires_at, status, fulfilled) VALUES (?, ?, ?, 'pending', 0)");
+        } elseif ($schema['pending_has_status']) {
+            $ins = $conn->prepare("INSERT INTO pending_rfid_assignments (user_id, token, expires_at, status) VALUES (?, ?, ?, 'pending')");
+        } elseif ($schema['pending_has_fulfilled']) {
+            $ins = $conn->prepare('INSERT INTO pending_rfid_assignments (user_id, token, expires_at, fulfilled) VALUES (?, ?, ?, 0)');
+        } else {
+            $ins = $conn->prepare('INSERT INTO pending_rfid_assignments (user_id, token, expires_at) VALUES (?, ?, ?)');
+        }
+        $ins->bind_param('iss', $userId, $token, $expiresAt);
+        $ins->execute();
+        $ins->close();
+
+        enrollApiRespond(['status' => 'ok', 'token' => $token, 'expires_in' => 120]);
+        return;
+    }
+
+    enrollApiRespond(['status' => 'error', 'msg' => 'Enrollment token tables are not configured'], 500);
+}
+
+function enrollApiHandlePoll(mysqli $conn, array $query, array $body): void
+{
+    $keyData = $body ?: $query;
+    if (!enrollApiCheckKey($keyData) && !enrollApiCheckKeyGet($query)) {
+        enrollApiRespond(['status' => 'error', 'msg' => 'Invalid API key'], 401);
+        return;
+    }
+
+    $schema = enrollApiSchema($conn);
+    enrollApiExpireTokens($conn, $schema);
+
+    if ($schema['has_enrollment_tokens']) {
+        $where = $schema['enrollment_has_status']
+            ? "status='pending' AND expires_at > NOW()"
+            : 'expires_at > NOW()';
+        $orderBy = $schema['enrollment_has_created_at'] ? 'created_at' : 'id';
+
+        $stmt = $conn->prepare(
+            "SELECT token,
+                    user_name,
+                    GREATEST(0, TIMESTAMPDIFF(SECOND, NOW(), expires_at)) AS secs_left
+             FROM enrollment_tokens
+             WHERE {$where}
+             ORDER BY {$orderBy} ASC
+             LIMIT 1"
+        );
+        $stmt->execute();
+        $stmt->bind_result($token, $userName, $secsLeft);
+        $found = $stmt->fetch();
+        $stmt->close();
+
+        if ($found) {
+            enrollApiRespond([
+                'pending' => true,
+                'token' => $token,
+                'username' => $userName,
+                'expires_in' => max(5, min(300, (int) $secsLeft)),
+            ]);
+            return;
+        }
+    }
+
+    if ($schema['has_pending_assignments']) {
+        $where = ['p.expires_at > NOW()'];
+        if ($schema['pending_has_status']) {
+            $where[] = "p.status='pending'";
+        }
+        if ($schema['pending_has_fulfilled']) {
+            $where[] = 'p.fulfilled=0';
+        }
+        $orderBy = $schema['pending_has_created_at'] ? 'p.created_at' : 'p.id';
+
+        $stmt = $conn->prepare(
+            "SELECT p.token,
+                    COALESCE(u.username, CONCAT('User #', p.user_id)) AS user_name,
+                    GREATEST(0, TIMESTAMPDIFF(SECOND, NOW(), p.expires_at)) AS secs_left
+             FROM pending_rfid_assignments p
+             LEFT JOIN users u ON u.id = p.user_id
+             WHERE " . implode(' AND ', $where) . "
+             ORDER BY {$orderBy} ASC
+             LIMIT 1"
+        );
+        $stmt->execute();
+        $stmt->bind_result($token, $userName, $secsLeft);
+        $found = $stmt->fetch();
+        $stmt->close();
+
+        if ($found) {
+            enrollApiRespond([
+                'pending' => true,
+                'token' => $token,
+                'username' => $userName,
+                'expires_in' => max(5, min(300, (int) $secsLeft)),
+            ]);
+            return;
+        }
+    }
+
+    enrollApiRespond(['pending' => false]);
+}
+
+function enrollApiHandleSubmit(mysqli $conn, array $body): void
+{
+    if (!enrollApiCheckKey($body)) {
+        enrollApiRespond(['status' => 'error', 'msg' => 'Invalid API key'], 401);
+        return;
+    }
+
+    $token = strtolower(trim((string) ($body['token'] ?? '')));
+    $uid = strtoupper(trim((string) ($body['uid'] ?? '')));
+
+    if ($token === '' || $uid === '') {
+        enrollApiRespond(['status' => 'error', 'msg' => 'token and uid are required'], 400);
+        return;
+    }
+    if (!preg_match('/^[0-9a-f]{64}$/', $token)) {
+        enrollApiRespond(['status' => 'error', 'msg' => 'Invalid token format'], 400);
+        return;
+    }
+    if (!enrollApiValidUid($uid)) {
+        enrollApiRespond(['status' => 'error', 'msg' => 'UID must be AA:BB:CC:DD'], 400);
+        return;
+    }
+
+    $schema = enrollApiSchema($conn);
+    enrollApiExpireTokens($conn, $schema);
+
+    $tokenRow = enrollApiFindToken($conn, $token, $schema);
+    if (!$tokenRow) {
+        enrollApiRespond(['status' => 'error', 'msg' => 'Token not found']);
+        return;
+    }
+
+    $tokenStatus = enrollApiNormalizedTokenStatus($tokenRow);
+    if ($tokenStatus === 'fulfilled') {
+        enrollApiRespond(['status' => 'duplicate', 'msg' => 'Token already used']);
+        return;
+    }
+    if ($tokenStatus === 'expired') {
+        enrollApiMarkTokenExpired($conn, $tokenRow, $schema);
+        enrollApiRespond(['status' => 'expired', 'msg' => 'Enrollment window expired - try again']);
+        return;
+    }
+
+    if (enrollApiUidExists($conn, $uid, $schema)) {
+        enrollApiRespond([
+            'status' => 'duplicate',
+            'msg' => 'Card already registered to another student',
+        ]);
+        return;
+    }
+
+    $userId = (int) ($tokenRow['user_id'] ?? 0);
+    $userName = (string) ($tokenRow['user_name'] ?? '');
+    if ($userId <= 0) {
+        $user = enrollApiFindUserByUsername($conn, $userName);
+        if (!$user) {
+            enrollApiRespond([
+                'status' => 'not_found',
+                'msg' => 'Student account not found for this enrollment token',
+            ], 404);
+            return;
+        }
+        $userId = (int) $user['id'];
+        $userName = (string) $user['username'];
+    }
+
+    if (enrollApiUserHasActiveCard($conn, $userId, $schema)) {
+        enrollApiRespond([
+            'status' => 'duplicate_user',
+            'msg' => 'This account already has an active RFID card',
+        ]);
+        return;
+    }
+
+    try {
+        $conn->begin_transaction();
+
+        enrollApiInsertCardMapping($conn, $schema, $userId, $userName, $uid);
+
+        enrollApiMarkTokenFulfilled($conn, $tokenRow, $schema);
+
+        $conn->commit();
+    } catch (Throwable $e) {
+        $conn->rollback();
+        error_log('[enroll_api/submit] ' . $e->getMessage());
+        enrollApiRespond(['status' => 'error', 'msg' => 'Database error - please try again'], 500);
+        return;
+    }
+
+    enrollApiRespond([
         'status' => 'ok',
-        'msg'    => 'Card linked for ' . $userName,
-        'name'   => $userName,
+        'msg' => 'Card linked for ' . $tokenRow['user_name'],
+        'name' => $tokenRow['user_name'],
     ]);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  G. CHECK — Browser: GET ?action=check&token=<hex64>
-//     "Has the ESP32 tapped the card yet?"
-// ════════════════════════════════════════════════════════════════════════════
-function handleCheck(mysqli $conn): void
+function enrollApiHandleCheck(mysqli $conn, array $query): void
 {
-    $token = trim($_GET['token'] ?? '');
+    $token = strtolower(trim((string) ($query['token'] ?? '')));
     if ($token === '' || !preg_match('/^[0-9a-f]{64}$/', $token)) {
-        http_response_code(400);
-        echo json_encode(['status' => 'error', 'msg' => 'Invalid token']);
+        enrollApiRespond(['status' => 'error', 'msg' => 'Invalid token'], 400);
         return;
     }
 
-    $stmt = $conn->prepare(
-        "SELECT status FROM enrollment_tokens WHERE token=? LIMIT 1"
-    );
-    $stmt->bind_param('s', $token);
-    $stmt->execute();
-    $stmt->bind_result($tokenStatus);
-    $found = $stmt->fetch();
-    $stmt->close();
+    $schema = enrollApiSchema($conn);
+    enrollApiExpireTokens($conn, $schema);
 
-    echo json_encode($found
-        ? ['status' => $tokenStatus]
-        : ['status' => 'expired', 'msg' => 'Token not found']
-    );
+    $tokenRow = enrollApiFindToken($conn, $token, $schema);
+    if (!$tokenRow) {
+        enrollApiRespond(['status' => 'expired', 'msg' => 'Token not found']);
+        return;
+    }
+
+    $status = enrollApiNormalizedTokenStatus($tokenRow);
+    if ($status === 'expired') {
+        enrollApiMarkTokenExpired($conn, $tokenRow, $schema);
+    }
+
+    enrollApiRespond(['status' => $status]);
+}
+
+function enrollApiHandleRequest(mysqli $conn, string $method, array $query, array $body): void
+{
+    $method = strtoupper($method);
+    $action = $method === 'GET'
+        ? strtolower(trim((string) ($query['action'] ?? '')))
+        : strtolower(trim((string) ($body['action'] ?? ($query['action'] ?? ''))));
+
+    switch ($action) {
+        case 'enroll':
+            enrollApiHandleDirectEnroll($conn, $body);
+            break;
+
+        case 'delete':
+            enrollApiHandleDirectDelete($conn, $body);
+            break;
+
+        case 'list':
+            enrollApiHandleList($conn, $query, $body);
+            break;
+
+        case 'request':
+            enrollApiHandleRequestToken($conn, $body);
+            break;
+
+        case 'poll':
+            enrollApiHandlePoll($conn, $query, $body);
+            break;
+
+        case 'submit':
+            enrollApiHandleSubmit($conn, $body);
+            break;
+
+        case 'check':
+            enrollApiHandleCheck($conn, $query);
+            break;
+
+        default:
+            enrollApiRespond(['status' => 'error', 'msg' => 'Unknown or missing action'], 400);
+    }
+}
+
+if (!defined('ENROLL_API_LIBRARY_MODE')) {
+    $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+    $query = $_GET;
+    $body = [];
+
+    if ($method !== 'GET') {
+        $raw = (string) file_get_contents('php://input', false, null, 0, 8192);
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded)) {
+            $body = $decoded;
+        } elseif (!empty($_POST) && is_array($_POST)) {
+            $body = $_POST;
+        }
+    }
+
+    enrollApiHandleRequest($conn, $method, $query, $body);
+    exit;
 }

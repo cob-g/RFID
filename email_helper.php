@@ -85,7 +85,7 @@ function sendVerificationEmail(string $toEmail, string $studentName, string $cod
 }
 
 /**
- * Send a seat-reservation confirmation email.
+ * Send a seat-reservation pending-confirmation email.
  */
 function sendSeatEmail(
     string $toEmail,
@@ -99,7 +99,7 @@ function sendSeatEmail(
 }
 
 /**
- * Send a computer-reservation confirmation email.
+ * Send a computer-reservation pending-confirmation email.
  */
 function sendComputerEmail(
     string $toEmail,
@@ -116,7 +116,7 @@ function queueSeatEmail(string $toEmail, string $studentName, string $seatNumber
     global $conn;
     $stmt = $conn->prepare("INSERT INTO email_queue (to_email, subject, body, status) VALUES (?, ?, ?, 'pending')");
     $data = _buildPayload('seat', $studentName, $seatNumber, null, $location, date('F j, Y \a\t g:i A'));
-    $subject = "✅ Allocation Confirmed – Seat {$seatNumber} | " . SCHOOL_NAME;
+    $subject = "⏳ Reservation Pending Confirmation – Seat {$seatNumber} | " . SCHOOL_NAME;
     $body = _buildHtml($data);
     $stmt->bind_param("sss", $toEmail, $subject, $body);
     return $stmt->execute();
@@ -126,7 +126,7 @@ function queueComputerEmail(string $toEmail, string $studentName, string $comput
     global $conn;
     $stmt = $conn->prepare("INSERT INTO email_queue (to_email, subject, body, status) VALUES (?, ?, ?, 'pending')");
     $data = _buildPayload('computer', $studentName, null, $computerNumber, $location, date('F j, Y \a\t g:i A'));
-    $subject = "✅ Allocation Confirmed – Computer {$computerNumber} | " . SCHOOL_NAME;
+    $subject = "⏳ Reservation Pending Confirmation – Computer {$computerNumber} | " . SCHOOL_NAME;
     $body = _buildHtml($data);
     $stmt->bind_param("sss", $toEmail, $subject, $body);
     return $stmt->execute();
@@ -175,7 +175,7 @@ function _buildPayload(
 
 function _dispatch(string $toEmail, string $studentName, array $d): bool
 {
-    $subject = "✅ Allocation Confirmed – {$d['subject_item']} | " . SCHOOL_NAME;
+    $subject = "⏳ Reservation Pending Confirmation – {$d['subject_item']} | " . SCHOOL_NAME;
     return _send($toEmail, $studentName, $subject, _buildHtml($d), _buildPlainText($d));
 }
 
@@ -238,7 +238,7 @@ function _buildHtml(array $d): string
           <p style="margin:0 0 10px;font-size:13px;font-weight:700;color:#1d4ed8;
                      letter-spacing:0.04em;text-transform:uppercase;">📋 Reminders</p>
           <ul style="margin:0;padding-left:18px;color:#374151;font-size:13.5px;line-height:1.8;">
-            <li>Please <strong>arrive on time</strong>. Unclaimed allocations may be forfeited after 15 minutes.</li>
+            <li>This reservation is released automatically if you do not <strong>TIME_IN within 15 minutes</strong>.</li>
             <li>To <strong>cancel</strong>, log in and click your reserved seat/computer before your session.</li>
             <li>Only <strong>one allocation</strong> per session is permitted per student.</li>
             <li>Report any equipment issues to library staff immediately.</li>
@@ -252,7 +252,7 @@ function _buildHtml(array $d): string
     return <<<HTML
     <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Allocation Confirmation</title></head>
+    <title>Reservation Pending Confirmation</title></head>
     <body style="margin:0;padding:0;background:{$bgColor};font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;">
     <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:{$bgColor};min-height:100vh;">
       <tr><td align="center" style="padding:40px 16px;">
@@ -263,7 +263,7 @@ function _buildHtml(array $d): string
             <td style="background:linear-gradient(135deg,{$accentColor} 0%,#1e40af 100%);
                        padding:36px 40px 32px;text-align:center;">
               <div style="font-size:48px;margin-bottom:10px;">{$d['icon']}</div>
-              <h1 style="margin:0 0 6px;color:#fff;font-size:22px;font-weight:700;">Allocation Confirmed!</h1>
+              <h1 style="margin:0 0 6px;color:#fff;font-size:22px;font-weight:700;">Reservation Pending Confirmation</h1>
               <p style="margin:0;color:rgba(255,255,255,0.80);font-size:13.5px;">{$d['system_name']}</p>
             </td>
           </tr>
@@ -272,8 +272,8 @@ function _buildHtml(array $d): string
               <p style="margin:0 0 20px;font-size:15.5px;color:{$bodyText};line-height:1.6;">
                 Hi <strong>{$d['student_name']}</strong>,</p>
               <p style="margin:0 0 24px;font-size:15px;color:{$bodyText};line-height:1.7;">
-                Your allocation has been <span style="color:{$greenColor};font-weight:700;">successfully confirmed</span>.
-                Below are the details of your reservation:</p>
+                Your reservation is <span style="color:{$greenColor};font-weight:700;">pending confirmation</span>.
+                Tap your RFID card to TIME_IN within <strong>15 minutes</strong> to keep this reservation active.</p>
               <table width="100%" cellpadding="0" cellspacing="0" border="0"
                      style="background:#f8f9fb;border:1px solid {$borderColor};border-radius:12px;
                             overflow:hidden;margin-bottom:8px;">
@@ -337,13 +337,13 @@ function _buildPlainText(array $d): string
           ? "Seat Number : {$d['seat_number']}"
           : "Computer    : {$d['computer_number']}";
 
-    return "✅ ALLOCATION CONFIRMED — {$d['school_name']}\n\n"
+      return "⏳ RESERVATION PENDING CONFIRMATION — {$d['school_name']}\n\n"
          . "Hi {$d['student_name']},\n\n"
-         . "Your allocation has been successfully confirmed.\n\n"
+         . "Your reservation is pending confirmation. Tap your RFID card to TIME_IN within 15 minutes.\n\n"
          . "ALLOCATION DETAILS\n------------------\n"
          . "{$item}\nLocation    : {$d['location']}\nDate & Time : {$d['datetime']}\n\n"
          . "REMINDERS\n---------\n"
-         . "• Arrive on time. Unclaimed allocations may be forfeited after 15 minutes.\n"
+         . "• This reservation is released automatically if you do not TIME_IN within 15 minutes.\n"
          . "• To cancel, log in and click your reserved seat/computer before your session.\n"
          . "• Only one allocation per session is permitted per student.\n"
          . "• Support: {$d['support_email']}\n\n"

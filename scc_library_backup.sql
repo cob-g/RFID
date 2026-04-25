@@ -28,13 +28,35 @@ CREATE TABLE `attendance` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
+CREATE TABLE `rfid_cards` (
+  `id` int(11) NOT NULL,
+  `name` varchar(100) NOT NULL,
+  `uid` varchar(32) NOT NULL,
+  `user_id` int(11) NOT NULL,
+  `status` enum('active','inactive') NOT NULL DEFAULT 'active',
+  `enrolled_at` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+
+CREATE TABLE `enrollment_tokens` (
+  `id` int(11) NOT NULL,
+  `user_id` int(11) NOT NULL,
+  `user_name` varchar(100) NOT NULL,
+  `token` varchar(64) NOT NULL,
+  `expires_at` datetime NOT NULL,
+  `status` varchar(20) NOT NULL DEFAULT 'pending',
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+
 CREATE TABLE `computers` (
   `id` int(11) NOT NULL,
   `computer_number` varchar(50) NOT NULL,
   `status` enum('available','reserved') DEFAULT 'available',
   `reserved_by` int(11) DEFAULT NULL,
   `reserved_at` datetime DEFAULT NULL,
-  `expires_at` datetime DEFAULT NULL
+  `expires_at` datetime DEFAULT NULL,
+  `reservation_status` enum('pending','confirmed') DEFAULT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 
@@ -88,7 +110,8 @@ CREATE TABLE `seats` (
   `status` enum('available','reserved') DEFAULT 'available',
   `reserved_by` int(11) DEFAULT NULL,
   `reserved_at` datetime DEFAULT NULL,
-  `expires_at` datetime DEFAULT NULL
+  `expires_at` datetime DEFAULT NULL,
+  `reservation_status` enum('pending','confirmed') DEFAULT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 
@@ -216,7 +239,17 @@ ALTER TABLE `attendance`
 ALTER TABLE `computers`
   ADD PRIMARY KEY (`id`),
   ADD KEY `idx_status` (`status`),
-  ADD KEY `idx_reserved_by` (`reserved_by`);
+  ADD KEY `idx_reserved_by` (`reserved_by`),
+  ADD KEY `idx_reservation_exp` (`reservation_status`,`expires_at`);
+
+--
+-- Indexes for table `enrollment_tokens`
+--
+ALTER TABLE `enrollment_tokens`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uq_enrollment_token` (`token`),
+  ADD UNIQUE KEY `uq_enrollment_user` (`user_id`),
+  ADD KEY `idx_enrollment_exp` (`expires_at`);
 
 --
 -- Indexes for table `pending_rfid_assignments`
@@ -236,12 +269,22 @@ ALTER TABLE `rfid_devices`
   ADD KEY `user_id` (`user_id`);
 
 --
+-- Indexes for table `rfid_cards`
+--
+ALTER TABLE `rfid_cards`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uq_rfid_cards_uid` (`uid`),
+  ADD UNIQUE KEY `uq_rfid_cards_user` (`user_id`),
+  ADD KEY `idx_rfid_cards_status` (`status`);
+
+--
 -- Indexes for table `seats`
 --
 ALTER TABLE `seats`
   ADD PRIMARY KEY (`id`),
   ADD KEY `idx_status` (`status`),
-  ADD KEY `idx_reserved_by` (`reserved_by`);
+  ADD KEY `idx_reserved_by` (`reserved_by`),
+  ADD KEY `idx_reservation_exp` (`reservation_status`,`expires_at`);
 
 --
 -- Indexes for table `users`
@@ -274,6 +317,12 @@ ALTER TABLE `computers`
   MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=11;
 
 --
+-- AUTO_INCREMENT for table `enrollment_tokens`
+--
+ALTER TABLE `enrollment_tokens`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
 -- AUTO_INCREMENT for table `pending_rfid_assignments`
 --
 ALTER TABLE `pending_rfid_assignments`
@@ -283,6 +332,12 @@ ALTER TABLE `pending_rfid_assignments`
 -- AUTO_INCREMENT for table `rfid_devices`
 --
 ALTER TABLE `rfid_devices`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `rfid_cards`
+--
+ALTER TABLE `rfid_cards`
   MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
 
 --
@@ -320,6 +375,12 @@ ALTER TABLE `computers`
   ADD CONSTRAINT `computers_ibfk_1` FOREIGN KEY (`reserved_by`) REFERENCES `users` (`id`) ON DELETE SET NULL;
 
 --
+-- Constraints for table `enrollment_tokens`
+--
+ALTER TABLE `enrollment_tokens`
+  ADD CONSTRAINT `fk_enrollment_tokens_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE ON UPDATE CASCADE;
+
+--
 -- Constraints for table `pending_rfid_assignments`
 --
 ALTER TABLE `pending_rfid_assignments`
@@ -330,5 +391,35 @@ ALTER TABLE `pending_rfid_assignments`
 --
 ALTER TABLE `rfid_devices`
   ADD CONSTRAINT `rfid_devices_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE;
+
+--
+-- Constraints for table `rfid_cards`
+--
+ALTER TABLE `rfid_cards`
+  ADD CONSTRAINT `fk_rfid_cards_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE ON UPDATE CASCADE;
+
+--
+-- One-time rollout backfill (run after schema deploy)
+-- Fill historical attendance.user_id where mapping is unambiguous.
+--
+UPDATE `attendance` a
+JOIN `rfid_cards` c ON c.uid = a.uid AND c.status = 'active'
+SET a.user_id = c.user_id
+WHERE a.user_id IS NULL;
+
+UPDATE `attendance` a
+JOIN `rfid_devices` d ON d.uid = a.uid AND d.status = 'active'
+SET a.user_id = d.user_id
+WHERE a.user_id IS NULL;
+
+UPDATE `attendance` a
+JOIN `users` u ON u.username = a.name
+SET a.user_id = u.id
+WHERE a.user_id IS NULL;
+
+UPDATE `attendance` a
+JOIN `users` u ON u.email = a.name
+SET a.user_id = u.id
+WHERE a.user_id IS NULL;
 SET FOREIGN_KEY_CHECKS = 1;
 

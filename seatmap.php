@@ -25,16 +25,108 @@ if (empty($_SESSION['user_id'])) {
 $user_id       = (int) $_SESSION['user_id'];
 $isAjaxRequest = ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax']));
 
+const RESERVATION_CONFIRM_WINDOW_MINUTES = 15;
+
+function isUserTimedInToday(mysqli $conn, int $userId): bool
+{
+    try {
+        $stmt = $conn->prepare(
+            'SELECT action
+             FROM attendance
+             WHERE user_id = ? AND date = CURDATE()
+             ORDER BY id DESC
+             LIMIT 1'
+        );
+        $stmt->bind_param('i', $userId);
+        $stmt->execute();
+        $row = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        return $row && ($row['action'] ?? '') === 'TIME_IN';
+    } catch (Throwable $e) {
+        error_log('[SeatSystem] timed-in check failed: ' . $e->getMessage());
+        return false;
+    }
+}
+
+function seatSystemColumnExists(mysqli $conn, string $table, string $column): bool
+{
+    static $cache = [];
+    $key = $table . '.' . $column;
+    if (array_key_exists($key, $cache)) {
+        return $cache[$key];
+    }
+
+    $stmt = $conn->prepare(
+        'SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ? LIMIT 1'
+    );
+    $stmt->bind_param('ss', $table, $column);
+    $stmt->execute();
+    $stmt->bind_result($one);
+    $exists = $stmt->fetch();
+    $stmt->close();
+
+    $cache[$key] = (bool) $exists;
+    return $cache[$key];
+}
+
+function seatSystemCleanupExpiredPendingInTable(mysqli $conn, string $table): int
+{
+    if (
+        !seatSystemColumnExists($conn, $table, 'status')
+        || !seatSystemColumnExists($conn, $table, 'reserved_by')
+        || !seatSystemColumnExists($conn, $table, 'expires_at')
+    ) {
+        return 0;
+    }
+
+    $setParts = ["status='available'", 'reserved_by=NULL'];
+    if (seatSystemColumnExists($conn, $table, 'reserved_at')) {
+        $setParts[] = 'reserved_at=NULL';
+    }
+    $setParts[] = 'expires_at=NULL';
+    if (seatSystemColumnExists($conn, $table, 'reservation_status')) {
+        $setParts[] = 'reservation_status=NULL';
+    }
+
+    $where = "status='reserved' AND reserved_by IS NOT NULL AND expires_at IS NOT NULL AND expires_at < NOW()";
+    if (seatSystemColumnExists($conn, $table, 'reservation_status')) {
+        $where .= " AND reservation_status='pending'";
+    }
+
+    $sql = 'UPDATE ' . $table . ' SET ' . implode(', ', $setParts) . ' WHERE ' . $where;
+    $stmt = $conn->prepare($sql);
+    $stmt->execute();
+    $affected = max(0, $stmt->affected_rows);
+    $stmt->close();
+
+    return $affected;
+}
+
+function seatSystemCleanupExpiredPendingAllocations(mysqli $conn): array
+{
+    return [
+        'seats' => seatSystemCleanupExpiredPendingInTable($conn, 'seats'),
+        'computers' => seatSystemCleanupExpiredPendingInTable($conn, 'computers'),
+    ];
+}
+
+seatSystemCleanupExpiredPendingAllocations($conn);
+
+$userTimedInNow = isUserTimedInToday($conn, $user_id);
+
 if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['poll'])) {
     while (ob_get_level()) ob_end_clean();
     header('Content-Type: application/json; charset=utf-8');
 
+    seatSystemCleanupExpiredPendingAllocations($conn);
+
     $seatRows = mysqli_fetch_all(
-        mysqli_query($conn, 'SELECT id, status, reserved_by FROM seats'),
+        mysqli_query($conn, 'SELECT id, seat_number, status, reserved_by, reserved_at, expires_at FROM seats'),
         MYSQLI_ASSOC
     );
     $compRows = mysqli_fetch_all(
-        mysqli_query($conn, 'SELECT id, status, reserved_by FROM computers'),
+        mysqli_query($conn, 'SELECT id, computer_number, status, reserved_by, reserved_at, expires_at FROM computers'),
         MYSQLI_ASSOC
     );
 
@@ -42,6 +134,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['poll'])) {
         'seats'     => $seatRows,
         'computers' => $compRows,
         'user_id'   => $user_id,
+        'timed_in'  => isUserTimedInToday($conn, $user_id),
     ], JSON_UNESCAPED_UNICODE);
     exit;
 }
@@ -147,6 +240,8 @@ function logAllocation(
 
 if ($isAjaxRequest) {
 
+    seatSystemCleanupExpiredPendingAllocations($conn);
+
     checkRateLimit($user_id);
 
     $submittedCsrf = $_POST['csrf'] ?? '';
@@ -198,11 +293,27 @@ if ($isAjaxRequest) {
                 }
             }
 
-            $stmt = $conn->prepare(
-                'UPDATE seats
-                 SET    status = "reserved", reserved_by = ?
-                 WHERE  id = ? AND status = "available"'
-            );
+            $hasSeatReservationStatus = seatSystemColumnExists($conn, 'seats', 'reservation_status');
+            if ($hasSeatReservationStatus) {
+                $stmt = $conn->prepare(
+                    'UPDATE seats
+                     SET    status = "reserved",
+                            reserved_by = ?,
+                            reserved_at = NOW(),
+                            expires_at = DATE_ADD(NOW(), INTERVAL ' . RESERVATION_CONFIRM_WINDOW_MINUTES . ' MINUTE),
+                            reservation_status = "pending"
+                     WHERE  id = ? AND status = "available"'
+                );
+            } else {
+                $stmt = $conn->prepare(
+                    'UPDATE seats
+                     SET    status = "reserved",
+                            reserved_by = ?,
+                            reserved_at = NOW(),
+                            expires_at = DATE_ADD(NOW(), INTERVAL ' . RESERVATION_CONFIRM_WINDOW_MINUTES . ' MINUTE)
+                     WHERE  id = ? AND status = "available"'
+                );
+            }
             $stmt->bind_param('ii', $user_id, $id);
             $stmt->execute();
             $affected = $stmt->affected_rows;
@@ -211,11 +322,26 @@ if ($isAjaxRequest) {
             if ($affected > 0) {
                 $action = 'reserved';
             } else {
-                $stmt = $conn->prepare(
-                    'UPDATE seats
-                     SET    status = "available", reserved_by = NULL
-                     WHERE  id = ? AND reserved_by = ?'
-                );
+                if ($hasSeatReservationStatus) {
+                    $stmt = $conn->prepare(
+                        'UPDATE seats
+                         SET    status = "available",
+                                reserved_by = NULL,
+                                reserved_at = NULL,
+                                expires_at = NULL,
+                                reservation_status = NULL
+                         WHERE  id = ? AND reserved_by = ?'
+                    );
+                } else {
+                    $stmt = $conn->prepare(
+                        'UPDATE seats
+                         SET    status = "available",
+                                reserved_by = NULL,
+                                reserved_at = NULL,
+                                expires_at = NULL
+                         WHERE  id = ? AND reserved_by = ?'
+                    );
+                }
                 $stmt->bind_param('ii', $id, $user_id);
                 $stmt->execute();
                 $affected = $stmt->affected_rows;
@@ -230,7 +356,7 @@ if ($isAjaxRequest) {
                 }
             }
 
-            $stmt = $conn->prepare('SELECT seat_number FROM seats WHERE id = ?');
+            $stmt = $conn->prepare('SELECT seat_number, expires_at FROM seats WHERE id = ?');
             $stmt->bind_param('i', $id);
             $stmt->execute();
             $seat = $stmt->get_result()->fetch_assoc();
@@ -260,13 +386,26 @@ if ($isAjaxRequest) {
                 }
             }
 
-            $displayAction = ($action === 'reserved') ? 'allocated' : 'released';
+            if ($action === 'reserved') {
+                jsonResponse([
+                    'success' => true,
+                    'action' => $action,
+                    'label' => $seat['seat_number'],
+                    'emailSent' => ($studentEmail !== ''),
+                    'expires_at' => $seat['expires_at'] ?? null,
+                    'message' => 'Seat ' . $seat['seat_number']
+                        . ' reserved. Tap your RFID card to TIME_IN within '
+                        . RESERVATION_CONFIRM_WINDOW_MINUTES
+                        . ' minutes to confirm and keep this allocation.',
+                ]);
+            }
+
             jsonResponse([
-                'success'   => true,
-                'action'    => $action,
-                'label'     => $seat['seat_number'],
-                'emailSent' => ($action === 'reserved' && $studentEmail !== ''),
-                'message'   => "Seat {$seat['seat_number']} {$displayAction} successfully.",
+                'success' => true,
+                'action' => $action,
+                'label' => $seat['seat_number'],
+                'emailSent' => false,
+                'message' => 'Seat ' . $seat['seat_number'] . ' released successfully.',
             ]);
         }
 
@@ -309,11 +448,27 @@ if ($isAjaxRequest) {
                 }
             }
 
-            $stmt = $conn->prepare(
-                'UPDATE computers
-                 SET    status = "reserved", reserved_by = ?
-                 WHERE  id = ? AND status = "available"'
-            );
+            $hasComputerReservationStatus = seatSystemColumnExists($conn, 'computers', 'reservation_status');
+            if ($hasComputerReservationStatus) {
+                $stmt = $conn->prepare(
+                    'UPDATE computers
+                     SET    status = "reserved",
+                            reserved_by = ?,
+                            reserved_at = NOW(),
+                            expires_at = DATE_ADD(NOW(), INTERVAL ' . RESERVATION_CONFIRM_WINDOW_MINUTES . ' MINUTE),
+                            reservation_status = "pending"
+                     WHERE  id = ? AND status = "available"'
+                );
+            } else {
+                $stmt = $conn->prepare(
+                    'UPDATE computers
+                     SET    status = "reserved",
+                            reserved_by = ?,
+                            reserved_at = NOW(),
+                            expires_at = DATE_ADD(NOW(), INTERVAL ' . RESERVATION_CONFIRM_WINDOW_MINUTES . ' MINUTE)
+                     WHERE  id = ? AND status = "available"'
+                );
+            }
             $stmt->bind_param('ii', $user_id, $id);
             $stmt->execute();
             $affected = $stmt->affected_rows;
@@ -322,11 +477,26 @@ if ($isAjaxRequest) {
             if ($affected > 0) {
                 $action = 'reserved';
             } else {
-                $stmt = $conn->prepare(
-                    'UPDATE computers
-                     SET    status = "available", reserved_by = NULL
-                     WHERE  id = ? AND reserved_by = ?'
-                );
+                if ($hasComputerReservationStatus) {
+                    $stmt = $conn->prepare(
+                        'UPDATE computers
+                         SET    status = "available",
+                                reserved_by = NULL,
+                                reserved_at = NULL,
+                                expires_at = NULL,
+                                reservation_status = NULL
+                         WHERE  id = ? AND reserved_by = ?'
+                    );
+                } else {
+                    $stmt = $conn->prepare(
+                        'UPDATE computers
+                         SET    status = "available",
+                                reserved_by = NULL,
+                                reserved_at = NULL,
+                                expires_at = NULL
+                         WHERE  id = ? AND reserved_by = ?'
+                    );
+                }
                 $stmt->bind_param('ii', $id, $user_id);
                 $stmt->execute();
                 $affected = $stmt->affected_rows;
@@ -341,7 +511,7 @@ if ($isAjaxRequest) {
                 }
             }
 
-            $stmt = $conn->prepare('SELECT computer_number FROM computers WHERE id = ?');
+            $stmt = $conn->prepare('SELECT computer_number, expires_at FROM computers WHERE id = ?');
             $stmt->bind_param('i', $id);
             $stmt->execute();
             $comp = $stmt->get_result()->fetch_assoc();
@@ -371,13 +541,26 @@ if ($isAjaxRequest) {
                 }
             }
 
-            $displayAction = ($action === 'reserved') ? 'allocated' : 'released';
+            if ($action === 'reserved') {
+                jsonResponse([
+                    'success' => true,
+                    'action' => $action,
+                    'label' => $comp['computer_number'],
+                    'emailSent' => ($studentEmail !== ''),
+                    'expires_at' => $comp['expires_at'] ?? null,
+                    'message' => 'Computer ' . $comp['computer_number']
+                        . ' reserved. Tap your RFID card to TIME_IN within '
+                        . RESERVATION_CONFIRM_WINDOW_MINUTES
+                        . ' minutes to confirm and keep this allocation.',
+                ]);
+            }
+
             jsonResponse([
-                'success'   => true,
-                'action'    => $action,
-                'label'     => $comp['computer_number'],
-                'emailSent' => ($action === 'reserved' && $studentEmail !== ''),
-                'message'   => "Computer {$comp['computer_number']} {$displayAction} successfully.",
+                'success' => true,
+                'action' => $action,
+                'label' => $comp['computer_number'],
+                'emailSent' => false,
+                'message' => 'Computer ' . $comp['computer_number'] . ' released successfully.',
             ]);
         }
 
@@ -393,14 +576,14 @@ if ($isAjaxRequest) {
 }
 
 $seatsStmt = $conn->prepare(
-    'SELECT id, seat_number, status, reserved_by FROM seats ORDER BY id'
+    'SELECT id, seat_number, status, reserved_by, reserved_at, expires_at FROM seats ORDER BY id'
 );
 $seatsStmt->execute();
 $seats = $seatsStmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $seatsStmt->close();
 
 $compsStmt = $conn->prepare(
-    'SELECT id, computer_number, status, reserved_by FROM computers ORDER BY id'
+    'SELECT id, computer_number, status, reserved_by, reserved_at, expires_at FROM computers ORDER BY id'
 );
 $compsStmt->execute();
 $computers = $compsStmt->get_result()->fetch_all(MYSQLI_ASSOC);
@@ -446,13 +629,14 @@ function seatButton(?array $seat, bool $forceDisabled = false): string
     $action     = $isMine ? 'release' : 'reserve';
     $seatId     = (int)$seat['id'];
     $label      = htmlspecialchars($seat['seat_number'], ENT_QUOTES, 'UTF-8');
+    $forceFlag  = $forceDisabled ? '1' : '0';
 
     return <<<HTML
     <form class="reservation-form" method="POST" style="display:inline;">
         <input type="hidden" name="csrf"    value="{$csrfToken}">
         <input type="hidden" name="seat_id" value="{$seatId}">
         <button type="submit" class="{$cls}"
-                data-seat-id="{$seatId}" data-action="{$action}" {$disabled}>
+                data-seat-id="{$seatId}" data-action="{$action}" data-force-disabled="{$forceFlag}" {$disabled}>
             {$label}
         </button>
     </form>
@@ -472,7 +656,6 @@ function computerButton(?array $comp): string
     } elseif ($comp['status'] !== 'available') {
         $cls .= ' taken';
     }
-
     $isDisabled = ($comp['status'] !== 'available' && !$isMine);
     $disabled   = $isDisabled ? 'disabled' : '';
     $action     = $isMine ? 'release' : 'reserve';
@@ -484,7 +667,7 @@ function computerButton(?array $comp): string
         <input type="hidden" name="csrf"        value="{$csrfToken}">
         <input type="hidden" name="computer_id" value="{$compId}">
         <button type="submit" class="{$cls}"
-                data-computer-id="{$compId}" data-action="{$action}" {$disabled}>
+                data-computer-id="{$compId}" data-action="{$action}" data-force-disabled="0" {$disabled}>
             🖥️ {$label}
         </button>
     </form>
@@ -688,6 +871,41 @@ body {
     backdrop-filter: blur(8px);
 }
 .my-allocations-bar.hidden { display: none; }
+
+.attendance-status {
+    border-bottom: 1px solid rgba(200, 169, 110, 0.22);
+    padding: 9px 28px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-size: 0.81rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    backdrop-filter: blur(8px);
+}
+.attendance-status.in {
+    background: rgba(34, 197, 94, 0.10);
+    color: #9be8b7;
+}
+.attendance-status.out {
+    background: rgba(239, 68, 68, 0.10);
+    color: #f9b4b4;
+}
+.attendance-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+}
+.attendance-status.in .attendance-dot {
+    background: #22c55e;
+    box-shadow: 0 0 8px rgba(34, 197, 94, 0.50);
+}
+.attendance-status.out .attendance-dot {
+    background: #ef4444;
+    box-shadow: 0 0 8px rgba(239, 68, 68, 0.45);
+}
 
 .alloc-label { font-weight: 700; color: var(--gold); margin-right: 4px; letter-spacing: 0.03em; }
 
@@ -1008,6 +1226,14 @@ body {
     color: var(--text-muted) !important;
     box-shadow: none !important;
     cursor: not-allowed;
+    border: 1px solid var(--glass-border);
+}
+
+.seat-button.attendance-locked,
+.computer-button.attendance-locked {
+    background: rgba(255,255,255,0.10) !important;
+    color: var(--text-muted) !important;
+    box-shadow: none !important;
     border: 1px solid var(--glass-border);
 }
 
@@ -1373,6 +1599,15 @@ body {
   </span>
 </div>
 
+<div class="attendance-status <?= $userTimedInNow ? 'in' : 'out' ?>" id="attendanceStatus">
+    <span class="attendance-dot"></span>
+    <span id="attendanceStatusText">
+        <?= $userTimedInNow
+                ? 'RFID status: TIME_IN. Any pending reservation is now confirmed.'
+                : 'RFID status: TIME_OUT. You can reserve now, then tap TIME_IN within 15 minutes to confirm.' ?>
+    </span>
+</div>
+
 <!-- ══════════════════ MAIN ══════════════════ -->
 <div class="main">
 
@@ -1609,10 +1844,13 @@ const confirmProceed  = document.getElementById('confirmProceed');
 const myAllocBar      = document.getElementById('myAllocBar');
 const allocChips      = document.getElementById('allocChips');
 const allocCounter    = document.getElementById('allocCounter');
+const attendanceStatus = document.getElementById('attendanceStatus');
+const attendanceStatusText = document.getElementById('attendanceStatusText');
 const drawerToggle    = document.getElementById('drawerToggle');
 const drawerOverlay   = document.getElementById('drawerOverlay');
 const mobileDrawer    = document.getElementById('mobileDrawer');
 const drawerClose     = document.getElementById('drawerClose');
+let userTimedIn       = <?= $userTimedInNow ? 'true' : 'false' ?>;
 
 function showModal(type, title, body, emailNote) {
     modalIcon.className    = 'modal-icon ' + type;
@@ -1639,18 +1877,35 @@ drawerToggle.addEventListener('click', openDrawer);
 drawerClose.addEventListener('click', closeDrawer);
 drawerOverlay.addEventListener('click', e => { if (e.target === drawerOverlay) closeDrawer(); });
 
+function syncAttendanceStatus(isTimedIn) {
+    attendanceStatus.classList.toggle('in', isTimedIn);
+    attendanceStatus.classList.toggle('out', !isTimedIn);
+    attendanceStatusText.textContent = isTimedIn
+        ? 'RFID status: TIME_IN. Any pending reservation is now confirmed.'
+    : 'RFID status: TIME_OUT. You can reserve now, then tap TIME_IN within 15 minutes to confirm.';
+}
+
+syncAttendanceStatus(userTimedIn);
+
 function refreshAllocBanner(seatsData, compsData) {
     const mySeats = seatsData.filter(s => s.reserved_by == MY_USER);
     const myComps = compsData.filter(c => c.reserved_by == MY_USER);
     const total   = mySeats.length + myComps.length;
 
+    const pendingLabel = (expiresAt) => {
+        if (!expiresAt) return '';
+        const ms = new Date(expiresAt.replace(' ', 'T')).getTime() - Date.now();
+        const mins = Math.max(1, Math.ceil(ms / 60000));
+        return ` ⏳${mins}m`;
+    };
+
     allocChips.innerHTML = [
-        ...mySeats.map(s => `<span class="alloc-chip" data-seat-id="${s.id}">🪑 ${escHtml(s.seat_number)}</span>`),
-        ...myComps.map(c => `<span class="alloc-chip" data-computer-id="${c.id}">🖥️ ${escHtml(c.computer_number)}</span>`),
+        ...mySeats.map(s => `<span class="alloc-chip" data-seat-id="${s.id}">🪑 ${escHtml(s.seat_number)}${pendingLabel(s.expires_at)}</span>`),
+        ...myComps.map(c => `<span class="alloc-chip" data-computer-id="${c.id}">🖥️ ${escHtml(c.computer_number)}${pendingLabel(c.expires_at)}</span>`),
     ].join('');
 
     allocCounter.innerHTML =
-        `<span class="poll-dot" title="Live updates active"></span>${total} / 2 used`;
+        `<span class="poll-dot" title="Live updates active"></span>${total} / 1 used`;
 
     myAllocBar.classList.toggle('hidden', total === 0);
 }
@@ -1683,10 +1938,12 @@ function syncButtons(seatsData, compsData) {
 function applyButtonState(btn, status, reservedBy, type) {
     const isMine  = (parseInt(reservedBy) === MY_USER);
     const isTaken = (status !== 'available' && !isMine);
-    if (btn.classList.contains('disabled')) return;
+    const forceDisabled = (btn.dataset.forceDisabled === '1');
+
     btn.classList.toggle('reserved-by-you', isMine);
     btn.classList.toggle('taken',           isTaken);
-    btn.disabled   = isTaken;
+
+    btn.disabled = forceDisabled || isTaken;
     btn.dataset.action = isMine ? 'release' : 'reserve';
 }
 
@@ -1697,6 +1954,10 @@ function poll() {
         .then(data => {
             if (!data) return;
             lastPollData = data;
+            if (typeof data.timed_in !== 'undefined') {
+                userTimedIn = !!data.timed_in;
+                syncAttendanceStatus(userTimedIn);
+            }
             syncButtons(data.seats, data.computers);
             refreshAllocBanner(data.seats, data.computers);
         })
@@ -1759,7 +2020,7 @@ function doFetch(formData, btn) {
             poll();
 
             const emailNote = (data.action === 'reserved' && data.emailSent)
-                ? 'A confirmation email has been sent to your registered address.'
+                ? 'A reservation email with the 15-minute confirmation policy was sent to your registered address.'
                 : null;
 
             showModal('success', 'Success', data.message, emailNote);

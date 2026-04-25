@@ -1,12 +1,22 @@
 <?php
 declare(strict_types=1);
 
-define('DB_HOST', 'sql200.infinityfree.com');
-define('DB_USER', 'if0_41597651');
-define('DB_PASS', '39L5uytNzWT');
-define('DB_NAME', 'if0_41597651_library_seat_system');
+define('DB_HOST', 'localhost');
+define('DB_USER', 'root');
+define('DB_PASS', '');
+define('DB_NAME', 'scc_library_local');
 define('DB_PORT', 3306);
 define('DB_CHARSET', 'utf8mb4');
+
+// Load RFID API key from environment when available; keep a safe fallback
+// so existing ESP32 deployments continue working without firmware changes.
+if (!defined('API_KEY')) {
+    $envApiKey = getenv('RFID_API_KEY');
+    if ($envApiKey === false || $envApiKey === '') {
+        $envApiKey = $_ENV['RFID_API_KEY'] ?? ($_SERVER['RFID_API_KEY'] ?? '');
+    }
+    define('API_KEY', (string) ($envApiKey !== '' ? $envApiKey : 'SCC-2026-SECURE'));
+}
 
 // ── Strict MySQLi error mode ───────────────────────────────────────────────────
 // All MySQLi errors will throw mysqli_sql_exception instead of returning false.
