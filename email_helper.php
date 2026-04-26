@@ -112,6 +112,42 @@ function sendComputerEmail(
     return _dispatch($toEmail, $studentName, $data);
 }
 
+/**
+ * Send a seat-reservation confirmed email after RFID TIME_IN.
+ */
+function sendSeatConfirmedEmail(
+  string $toEmail,
+  string $studentName,
+  array $seatNumbers,
+  string $location = 'Study Area',
+  string $datetime = ''
+): bool {
+  $seatNumbers = array_values(array_unique(array_filter(array_map(
+    static fn($v): string => trim((string) $v),
+    $seatNumbers
+  ), static fn(string $v): bool => $v !== '')));
+
+  if (empty($seatNumbers)) {
+    return false;
+  }
+
+  date_default_timezone_set('Asia/Manila');
+  if ($datetime === '') {
+    $datetime = date('F j, Y \\a\\t g:i A');
+  }
+
+  $seatList = implode(', ', $seatNumbers);
+  $subjectItem = count($seatNumbers) === 1
+    ? ('Seat ' . $seatNumbers[0])
+    : ('Seats ' . $seatList);
+
+  $subject = '✅ Reservation Confirmed – ' . $subjectItem . ' | ' . SCHOOL_NAME;
+  $html = _buildSeatConfirmedHtml($studentName, $seatList, $location, $datetime);
+  $text = _buildSeatConfirmedPlainText($studentName, $seatList, $location, $datetime);
+
+  return _send($toEmail, $studentName, $subject, $html, $text);
+}
+
 function queueSeatEmail(string $toEmail, string $studentName, string $seatNumber, string $location = 'Study Area') {
     global $conn;
     $stmt = $conn->prepare("INSERT INTO email_queue (to_email, subject, body, status) VALUES (?, ?, ?, 'pending')");
@@ -349,4 +385,93 @@ function _buildPlainText(array $d): string
          . "• Support: {$d['support_email']}\n\n"
          . "Library Services Team\n{$d['school_name']}\n{$d['school_address']}\n\n"
          . "──\nThis is an automated message. Please do not reply directly.";
+}
+
+function _buildSeatConfirmedHtml(
+    string $studentName,
+    string $seatList,
+    string $location,
+    string $datetime
+): string {
+    $safeName = htmlspecialchars($studentName, ENT_QUOTES, 'UTF-8');
+    $safeSeats = htmlspecialchars($seatList, ENT_QUOTES, 'UTF-8');
+    $safeLocation = htmlspecialchars($location, ENT_QUOTES, 'UTF-8');
+    $safeDatetime = htmlspecialchars($datetime, ENT_QUOTES, 'UTF-8');
+    $support = htmlspecialchars(SUPPORT_EMAIL, ENT_QUOTES, 'UTF-8');
+    $school = htmlspecialchars(SCHOOL_NAME, ENT_QUOTES, 'UTF-8');
+    $system = htmlspecialchars(SYSTEM_NAME, ENT_QUOTES, 'UTF-8');
+    $address = htmlspecialchars(SCHOOL_ADDRESS, ENT_QUOTES, 'UTF-8');
+    $website = htmlspecialchars(SCHOOL_WEBSITE, ENT_QUOTES, 'UTF-8');
+
+    return <<<HTML
+    <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Reservation Confirmed</title></head>
+    <body style="margin:0;padding:0;background:#f3f4f6;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;">
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f3f4f6;min-height:100vh;">
+      <tr><td align="center" style="padding:34px 16px;">
+        <table width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 8px 28px rgba(15,23,42,0.10);">
+          <tr>
+            <td style="background:linear-gradient(135deg,#16a34a 0%,#15803d 100%);padding:30px 34px 26px;text-align:center;">
+              <div style="font-size:40px;line-height:1;margin-bottom:10px;">✅</div>
+              <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:700;">Reservation Confirmed</h1>
+              <p style="margin:8px 0 0;color:rgba(255,255,255,0.88);font-size:13px;">{$system}</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:28px 34px 18px;">
+              <p style="margin:0 0 14px;font-size:15px;color:#111827;line-height:1.6;">Hi <strong>{$safeName}</strong>,</p>
+              <p style="margin:0 0 18px;font-size:14.5px;color:#1f2937;line-height:1.7;">
+                Your pending reservation has been confirmed after your RFID TIME_IN.</p>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">
+                <tr><td style="padding:16px 18px;">
+                  <p style="margin:0 0 8px;font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.06em;">Seat</p>
+                  <p style="margin:0 0 12px;font-size:15px;color:#065f46;font-weight:700;">{$safeSeats}</p>
+                  <p style="margin:0 0 8px;font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.06em;">Location</p>
+                  <p style="margin:0 0 12px;font-size:14px;color:#1f2937;font-weight:600;">{$safeLocation}</p>
+                  <p style="margin:0 0 8px;font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.06em;">Confirmed At</p>
+                  <p style="margin:0;font-size:14px;color:#1f2937;font-weight:600;">{$safeDatetime}</p>
+                </td></tr>
+              </table>
+              <p style="margin:18px 0 0;font-size:13.5px;color:#4b5563;line-height:1.7;">
+                If you no longer need this allocation, you can release it from the portal.</p>
+              <p style="margin:16px 0 0;font-size:13.5px;color:#4b5563;line-height:1.7;">
+                Need help? Contact <a href="mailto:{$support}" style="color:#16a34a;text-decoration:none;">{$support}</a>.</p>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:20px 0 0;">
+                <tr><td align="center">
+                  <a href="{$website}" style="display:inline-block;background:#16a34a;color:#ffffff;text-decoration:none;padding:12px 28px;border-radius:10px;font-size:14px;font-weight:700;">Open Allocation System</a>
+                </td></tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:18px 30px;text-align:center;">
+              <p style="margin:0 0 4px;font-size:11.5px;color:#6b7280;">Library Services Team</p>
+              <p style="margin:0;font-size:11.5px;color:#6b7280;">{$school}<br>{$address}</p>
+            </td>
+          </tr>
+        </table>
+      </td></tr>
+    </table>
+    </body></html>
+    HTML;
+}
+
+function _buildSeatConfirmedPlainText(
+    string $studentName,
+    string $seatList,
+    string $location,
+    string $datetime
+): string {
+    return "✅ RESERVATION CONFIRMED — " . SCHOOL_NAME . "\n\n"
+        . "Hi {$studentName},\n\n"
+        . "Your pending reservation has been confirmed after your RFID TIME_IN.\n\n"
+        . "DETAILS\n-------\n"
+        . "Seat       : {$seatList}\n"
+        . "Location   : {$location}\n"
+        . "Confirmed  : {$datetime}\n\n"
+        . "If you no longer need this allocation, you can release it from the portal.\n"
+        . "Support: " . SUPPORT_EMAIL . "\n\n"
+        . "Library Services Team\n" . SCHOOL_NAME . "\n" . SCHOOL_ADDRESS . "\n\n"
+        . "--\nThis is an automated message. Please do not reply directly.";
 }

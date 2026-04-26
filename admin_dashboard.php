@@ -11,6 +11,15 @@ if (!isset($_SESSION['csrf_token'])) {
 
 $current_role = $_SESSION['role'];
 
+$rfidPortalUrl = getenv('RFID_PORTAL_URL');
+if ($rfidPortalUrl === false || trim($rfidPortalUrl) === '') {
+    $rfidPortalUrl = 'http://192.168.0.100/';
+}
+$rfidPortalUrl = rtrim((string) $rfidPortalUrl, '/') . '/';
+if (!filter_var($rfidPortalUrl, FILTER_VALIDATE_URL)) {
+    $rfidPortalUrl = 'http://192.168.0.100/';
+}
+
 $total_users               = mysqli_fetch_assoc(mysqli_query($conn, "SELECT COUNT(*) AS total FROM users"))['total'];
 $total_reserved            = mysqli_fetch_assoc(mysqli_query($conn, "SELECT COUNT(*) AS total FROM seats WHERE status='reserved'"))['total'];
 $total_available           = mysqli_fetch_assoc(mysqli_query($conn, "SELECT COUNT(*) AS total FROM seats WHERE status='available'"))['total'];
@@ -582,6 +591,144 @@ tbody tr:last-child td { border-bottom: none; }
     padding: 32px;
 }
 
+.rfid-actions-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 10px;
+    margin-bottom: 14px;
+}
+
+.rfid-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--glass-border);
+    background: var(--glass-bg);
+    color: var(--text-main);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.84rem;
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: none;
+    transition: all var(--transition);
+}
+
+.rfid-btn:hover {
+    background: var(--glass-bg-md);
+    border-color: rgba(200, 169, 110, 0.35);
+}
+
+.rfid-btn.warn {
+    background: rgba(245, 158, 11, 0.10);
+    border-color: rgba(245, 158, 11, 0.30);
+    color: #fbbf24;
+}
+
+.rfid-btn.warn:hover {
+    background: rgba(245, 158, 11, 0.18);
+    border-color: rgba(245, 158, 11, 0.48);
+}
+
+.rfid-btn.danger {
+    background: rgba(239, 68, 68, 0.10);
+    border-color: rgba(239, 68, 68, 0.30);
+    color: #f87171;
+}
+
+.rfid-btn.danger:hover {
+    background: rgba(239, 68, 68, 0.18);
+    border-color: rgba(239, 68, 68, 0.50);
+}
+
+.rfid-inline-panel {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
+    padding: 12px;
+    margin-bottom: 14px;
+}
+
+.rfid-inline-panel label {
+    display: block;
+    font-size: 0.78rem;
+    color: var(--text-sub);
+    margin-bottom: 7px;
+}
+
+.rfid-inline-panel input {
+    width: 100%;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--glass-border);
+    border-radius: 8px;
+    color: var(--text-main);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.84rem;
+    padding: 10px 11px;
+    margin-bottom: 8px;
+}
+
+.rfid-inline-panel input:focus {
+    outline: none;
+    border-color: rgba(200, 169, 110, 0.50);
+    box-shadow: 0 0 0 3px rgba(200, 169, 110, 0.16);
+}
+
+.rfid-note {
+    font-size: 0.76rem;
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+
+.rfid-ops-message {
+    margin-bottom: 14px;
+    display: none;
+}
+
+.rfid-ops-message.ok,
+.rfid-ops-message.err,
+.rfid-ops-message.warn {
+    display: block;
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 0.84rem;
+    line-height: 1.5;
+}
+
+.rfid-ops-message.ok {
+    background: rgba(34, 197, 94, 0.14);
+    border: 1px solid rgba(34, 197, 94, 0.30);
+    color: #4ade80;
+}
+
+.rfid-ops-message.warn {
+    background: rgba(245, 158, 11, 0.14);
+    border: 1px solid rgba(245, 158, 11, 0.30);
+    color: #fbbf24;
+}
+
+.rfid-ops-message.err {
+    background: rgba(239, 68, 68, 0.14);
+    border: 1px solid rgba(239, 68, 68, 0.30);
+    color: #fca5a5;
+}
+
+.rfid-frame-wrap {
+    overflow: hidden;
+    padding: 0;
+}
+
+.rfid-frame {
+    width: 100%;
+    min-height: 780px;
+    border: 0;
+    display: block;
+    background: #fff;
+}
+
 /* ═══════════════════════════════════════════
    RESPONSIVE
 ═══════════════════════════════════════════ */
@@ -595,6 +742,7 @@ tbody tr:last-child td { border-bottom: none; }
     .card p { font-size: 1.8rem; }
     .page-header-text h1 { font-size: 1.5rem; }
     th, td { padding: 10px 12px; }
+    .rfid-frame { min-height: 640px; }
 }
 
 @media (max-width: 380px) {
@@ -640,6 +788,9 @@ tbody tr:last-child td { border-bottom: none; }
         </button>
         <button class="tab-button" data-tab="computers">
             <span class="nav-icon">🖥️</span> Manage Computers
+        </button>
+        <button class="tab-button" data-tab="rfid-portal">
+            <span class="nav-icon">📡</span> RFID Portal
         </button>
     </div>
 
@@ -880,6 +1031,51 @@ tbody tr:last-child td { border-bottom: none; }
             </div>
         </section>
 
+        <!-- ══════ RFID PORTAL SECTION ══════ -->
+        <section id="rfid-portal" class="section">
+            <div class="section-title">RFID Device Portal</div>
+
+            <div class="welcome-box" style="margin-bottom:14px;">
+                This section embeds the ESP32 portal inside the admin dashboard.
+                Use it to run enrollment actions and device maintenance without leaving the panel.
+                <br>
+                Device URL:
+                <a href="<?= htmlspecialchars($rfidPortalUrl) ?>" target="_blank" rel="noopener noreferrer" style="color:var(--gold-light);">
+                    <?= htmlspecialchars($rfidPortalUrl) ?>
+                </a>
+            </div>
+
+            <div class="rfid-actions-grid">
+                <button type="button" class="rfid-btn" id="btnRefreshRfidFrame">↻ Refresh Embedded Portal</button>
+                <a class="rfid-btn" href="<?= htmlspecialchars($rfidPortalUrl) ?>" target="_blank" rel="noopener noreferrer">↗ Open Portal in New Tab</a>
+                <button type="button" class="rfid-btn warn" id="btnCheckRfidPortal">📶 Check Device Connection</button>
+                <button type="button" class="rfid-btn danger" id="btnClearOfflineQueue">🧹 Clear Offline Queue</button>
+            </div>
+
+            <div class="rfid-inline-panel">
+                <label for="rfidResetUid">Reset offline one-time-in/out test state</label>
+                <input type="text" id="rfidResetUid" placeholder="Optional UID (AA:BB:CC:DD). Leave blank to reset all sessions.">
+                <button type="button" class="rfid-btn warn" id="btnResetOfflineSessions">🔁 Reset Offline Sessions</button>
+                <div class="rfid-note">
+                    Queue reset uses <strong>/queue/clear</strong>. Session reset uses <strong>/sessions/reset</strong>.
+                    If your firmware does not yet support <strong>/sessions/reset</strong>, restart the ESP32 to clear in-memory card sessions.
+                </div>
+            </div>
+
+            <div id="rfidOpsMessage" class="rfid-ops-message"></div>
+
+            <div class="table-wrap rfid-frame-wrap">
+                <iframe
+                    id="rfidPortalFrame"
+                    class="rfid-frame"
+                    src="<?= htmlspecialchars($rfidPortalUrl) ?>"
+                    data-src="<?= htmlspecialchars($rfidPortalUrl) ?>"
+                    title="RFID Device Portal"
+                    loading="lazy"
+                ></iframe>
+            </div>
+        </section>
+
     </div><!-- /main-content -->
 </div><!-- /flex col -->
 </div><!-- /wrapper -->
@@ -900,6 +1096,108 @@ buttons.forEach(btn => {
         closeSidebar();
     });
 });
+
+const RFID_PROXY_URL = 'rfid_portal_proxy.php';
+const CSRF_TOKEN = '<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>';
+
+const rfidPortalFrame = document.getElementById('rfidPortalFrame');
+const rfidOpsMessage = document.getElementById('rfidOpsMessage');
+const btnRefreshRfidFrame = document.getElementById('btnRefreshRfidFrame');
+const btnCheckRfidPortal = document.getElementById('btnCheckRfidPortal');
+const btnClearOfflineQueue = document.getElementById('btnClearOfflineQueue');
+const btnResetOfflineSessions = document.getElementById('btnResetOfflineSessions');
+const rfidResetUid = document.getElementById('rfidResetUid');
+
+function showRfidMessage(type, text) {
+    if (!rfidOpsMessage) return;
+    rfidOpsMessage.className = 'rfid-ops-message ' + type;
+    rfidOpsMessage.textContent = text;
+}
+
+function normalizeUid(rawUid) {
+    return String(rawUid || '').trim().toUpperCase();
+}
+
+async function postRfidProxy(action, payload = {}) {
+    const body = new URLSearchParams();
+    body.set('action', action);
+    body.set('csrf', CSRF_TOKEN);
+    Object.entries(payload).forEach(([k, v]) => {
+        body.set(k, String(v));
+    });
+
+    const res = await fetch(RFID_PROXY_URL, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: body.toString(),
+    });
+
+    let data = null;
+    try {
+        data = await res.json();
+    } catch (e) {
+        throw new Error('RFID proxy returned an invalid response.');
+    }
+
+    if (!res.ok || !data || data.success !== true) {
+        throw new Error((data && data.message) ? data.message : 'RFID action failed.');
+    }
+
+    return data;
+}
+
+if (btnRefreshRfidFrame && rfidPortalFrame) {
+    btnRefreshRfidFrame.addEventListener('click', () => {
+        const src = rfidPortalFrame.dataset.src || rfidPortalFrame.src;
+        rfidPortalFrame.src = src + (src.includes('?') ? '&' : '?') + 't=' + Date.now();
+        showRfidMessage('ok', 'Embedded RFID portal refreshed.');
+    });
+}
+
+if (btnCheckRfidPortal) {
+    btnCheckRfidPortal.addEventListener('click', async () => {
+        try {
+            const res = await postRfidProxy('ping');
+            showRfidMessage('ok', res.message || 'RFID device is reachable.');
+        } catch (err) {
+            showRfidMessage('err', err.message || 'Unable to reach RFID device.');
+        }
+    });
+}
+
+if (btnClearOfflineQueue) {
+    btnClearOfflineQueue.addEventListener('click', async () => {
+        if (!confirm('Clear all offline queued taps on the RFID device?')) return;
+        try {
+            const res = await postRfidProxy('queue_clear');
+            showRfidMessage('ok', res.message || 'Offline queue cleared.');
+        } catch (err) {
+            showRfidMessage('err', err.message || 'Failed to clear offline queue.');
+        }
+    });
+}
+
+if (btnResetOfflineSessions) {
+    btnResetOfflineSessions.addEventListener('click', async () => {
+        const uid = normalizeUid(rfidResetUid ? rfidResetUid.value : '');
+        const ask = uid !== ''
+            ? ('Reset offline session for UID ' + uid + '?')
+            : 'Reset all offline sessions on the RFID device?';
+        if (!confirm(ask)) return;
+
+        try {
+            const payload = {};
+            if (uid !== '') payload.uid = uid;
+            const res = await postRfidProxy('reset_sessions', payload);
+            showRfidMessage('ok', res.message || 'Offline sessions reset.');
+        } catch (err) {
+            showRfidMessage('warn', err.message || 'Session reset is unavailable on this firmware.');
+        }
+    });
+}
 
 /* ── Mobile sidebar ── */
 const sidebar       = document.getElementById('sidebar');

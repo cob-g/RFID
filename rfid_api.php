@@ -20,6 +20,7 @@ if (!in_array($method, ['GET', 'POST'], true)) {
 }
 
 require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/email_helper.php';
 
 $query = $_GET;
 $data = [];
@@ -214,10 +215,27 @@ try {
 
 $confirmed = ['seats' => 0, 'computers' => 0];
 if ($action === 'TIME_IN' && $card['user_id'] !== null) {
+    $timeInUserId = (int) $card['user_id'];
+    $pendingSeatLabels = [];
+
     try {
-        $confirmed = rfidApiConfirmPendingReservations($conn, (int) $card['user_id']);
+        $pendingSeatLabels = rfidApiPendingSeatLabelsForUser($conn, $timeInUserId);
+    } catch (Throwable $e) {
+        error_log('[rfid_api] Pending seat lookup failed: ' . $e->getMessage());
+    }
+
+    try {
+        $confirmed = rfidApiConfirmPendingReservations($conn, $timeInUserId);
     } catch (Throwable $e) {
         error_log('[rfid_api] Pending confirmation failed: ' . $e->getMessage());
+    }
+
+    if ($confirmed['seats'] > 0) {
+        try {
+            rfidApiSendSeatConfirmedEmailForUser($conn, $timeInUserId, $pendingSeatLabels, $date . ' ' . $time);
+        } catch (Throwable $e) {
+            error_log('[rfid_api] Seat confirmed email failed: ' . $e->getMessage());
+        }
     }
 }
 
@@ -610,6 +628,180 @@ function rfidApiConfirmPendingReservations(mysqli $conn, int $userId): array
         'seats' => rfidApiConfirmPendingTable($conn, 'seats', $userId),
         'computers' => rfidApiConfirmPendingTable($conn, 'computers', $userId),
     ];
+}
+
+function rfidApiPendingSeatLabelsForUser(mysqli $conn, int $userId): array
+{
+    if (
+        !rfidApiTableExists($conn, 'seats')
+        || !rfidApiColumnExists($conn, 'seats', 'reserved_by')
+        || !rfidApiColumnExists($conn, 'seats', 'status')
+        || !rfidApiColumnExists($conn, 'seats', 'expires_at')
+        || !rfidApiColumnExists($conn, 'seats', 'seat_number')
+    ) {
+        return [];
+    }
+
+    $where = "reserved_by = ? AND status='reserved' AND expires_at IS NOT NULL AND expires_at >= NOW()";
+    if (rfidApiColumnExists($conn, 'seats', 'reservation_status')) {
+        $where .= " AND reservation_status='pending'";
+    }
+
+    $stmt = $conn->prepare('SELECT seat_number FROM seats WHERE ' . $where . ' ORDER BY id');
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    $labels = [];
+    while ($row = $result->fetch_assoc()) {
+        $label = trim((string) ($row['seat_number'] ?? ''));
+        if ($label !== '') {
+            $labels[] = $label;
+        }
+    }
+    $stmt->close();
+
+    return $labels;
+}
+
+function rfidApiCurrentSeatLabelsForUser(mysqli $conn, int $userId): array
+{
+    if (
+        !rfidApiTableExists($conn, 'seats')
+        || !rfidApiColumnExists($conn, 'seats', 'reserved_by')
+        || !rfidApiColumnExists($conn, 'seats', 'status')
+        || !rfidApiColumnExists($conn, 'seats', 'seat_number')
+    ) {
+        return [];
+    }
+
+    $stmt = $conn->prepare("SELECT seat_number FROM seats WHERE reserved_by = ? AND status='reserved' ORDER BY id");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    $labels = [];
+    while ($row = $result->fetch_assoc()) {
+        $label = trim((string) ($row['seat_number'] ?? ''));
+        if ($label !== '') {
+            $labels[] = $label;
+        }
+    }
+    $stmt->close();
+
+    return $labels;
+}
+
+function rfidApiLookupUserContact(mysqli $conn, int $userId): ?array
+{
+    $stmt = $conn->prepare('SELECT username, email FROM users WHERE id = ? LIMIT 1');
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $stmt->bind_result($username, $email);
+    $found = $stmt->fetch();
+    $stmt->close();
+
+    if (!$found) {
+        return null;
+    }
+
+    $email = trim((string) $email);
+    if ($email === '') {
+        return null;
+    }
+
+    $name = trim((string) $username);
+    if ($name === '') {
+        $name = 'Student';
+    }
+
+    return ['name' => $name, 'email' => $email];
+}
+
+function rfidApiNormalizeSeatLabelsForEmailKey(array $seatLabels): array
+{
+    $labels = array_values(array_unique(array_filter(array_map(
+        static fn($v): string => trim((string) $v),
+        $seatLabels
+    ), static fn(string $v): bool => $v !== '')));
+
+    sort($labels, SORT_NATURAL | SORT_FLAG_CASE);
+    return $labels;
+}
+
+function rfidApiSeatConfirmedEmailKey(int $userId, array $seatLabels, string $timeInAt): string
+{
+    $labels = rfidApiNormalizeSeatLabelsForEmailKey($seatLabels);
+    return hash('sha256', $userId . '|' . trim($timeInAt) . '|' . implode('|', $labels));
+}
+
+function rfidApiSeatConfirmedEmailFlagPath(string $emailKey): string
+{
+    $tmpDir = rtrim((string) sys_get_temp_dir(), '\\/' . DIRECTORY_SEPARATOR);
+    if ($tmpDir === '') {
+        $tmpDir = __DIR__;
+    }
+
+    return $tmpDir . DIRECTORY_SEPARATOR . 'scc_seat_confirm_' . $emailKey . '.flag';
+}
+
+function rfidApiSeatConfirmedEmailWasSent(string $emailKey): bool
+{
+    return is_file(rfidApiSeatConfirmedEmailFlagPath($emailKey));
+}
+
+function rfidApiSeatConfirmedEmailMarkSent(string $emailKey): void
+{
+    @file_put_contents(rfidApiSeatConfirmedEmailFlagPath($emailKey), date('c'));
+}
+
+function rfidApiSendSeatConfirmedEmailForUser(
+    mysqli $conn,
+    int $userId,
+    array $pendingSeatLabels,
+    string $timeInAt = ''
+): void
+{
+    if (!function_exists('sendSeatConfirmedEmail')) {
+        return;
+    }
+
+    $contact = rfidApiLookupUserContact($conn, $userId);
+    if ($contact === null) {
+        return;
+    }
+
+    $seatLabels = $pendingSeatLabels;
+    if (empty($seatLabels)) {
+        $seatLabels = rfidApiCurrentSeatLabelsForUser($conn, $userId);
+    }
+    if (empty($seatLabels)) {
+        return;
+    }
+
+    $timeInAt = trim($timeInAt);
+    if ($timeInAt === '') {
+        $timeInAt = date('Y-m-d H:i:s');
+    }
+
+    $emailKey = rfidApiSeatConfirmedEmailKey($userId, $seatLabels, $timeInAt);
+    if (rfidApiSeatConfirmedEmailWasSent($emailKey)) {
+        return;
+    }
+
+    $sent = sendSeatConfirmedEmail(
+        $contact['email'],
+        $contact['name'],
+        $seatLabels,
+        'Study Area - Library'
+    );
+
+    if (!$sent) {
+        error_log('[rfid_api] Seat confirmed email returned false for user_id=' . $userId);
+        return;
+    }
+
+    rfidApiSeatConfirmedEmailMarkSent($emailKey);
 }
 
 function rfidApiAutoReleaseAllocations(mysqli $conn, int $userId): array

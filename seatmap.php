@@ -60,6 +60,28 @@ function seatSystemLatestAttendanceActionToday(mysqli $conn, int $userId): ?stri
     }
 }
 
+function seatSystemLatestTimeInAtToday(mysqli $conn, int $userId): string
+{
+    try {
+        $stmt = $conn->prepare(
+            "SELECT DATE_FORMAT(TIMESTAMP(date, time), '%Y-%m-%d %H:%i:%s') AS time_in_at
+             FROM attendance
+             WHERE user_id = ? AND action = 'TIME_IN' AND date = CURDATE()
+             ORDER BY id DESC
+             LIMIT 1"
+        );
+        $stmt->bind_param('i', $userId);
+        $stmt->execute();
+        $row = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        return trim((string) ($row['time_in_at'] ?? ''));
+    } catch (Throwable $e) {
+        error_log('[SeatSystem] latest TIME_IN lookup failed: ' . $e->getMessage());
+        return '';
+    }
+}
+
 function seatSystemColumnExists(mysqli $conn, string $table, string $column): bool
 {
     static $cache = [];
@@ -152,6 +174,212 @@ function seatSystemConfirmPendingForUserInTable(mysqli $conn, string $table, int
     return $affected;
 }
 
+function seatSystemPendingSeatLabelsForUser(mysqli $conn, int $userId): array
+{
+    if (
+        !seatSystemColumnExists($conn, 'seats', 'status')
+        || !seatSystemColumnExists($conn, 'seats', 'reserved_by')
+        || !seatSystemColumnExists($conn, 'seats', 'expires_at')
+        || !seatSystemColumnExists($conn, 'seats', 'seat_number')
+    ) {
+        return [];
+    }
+
+    $where = "reserved_by = ? AND status='reserved' AND expires_at IS NOT NULL AND expires_at >= NOW()";
+    if (seatSystemColumnExists($conn, 'seats', 'reservation_status')) {
+        $where .= " AND reservation_status='pending'";
+    }
+
+    $stmt = $conn->prepare('SELECT seat_number FROM seats WHERE ' . $where . ' ORDER BY id');
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    $labels = [];
+    while ($row = $result->fetch_assoc()) {
+        $label = trim((string) ($row['seat_number'] ?? ''));
+        if ($label !== '') {
+            $labels[] = $label;
+        }
+    }
+    $stmt->close();
+
+    return $labels;
+}
+
+function seatSystemCurrentSeatLabelsForUser(mysqli $conn, int $userId): array
+{
+    if (
+        !seatSystemColumnExists($conn, 'seats', 'status')
+        || !seatSystemColumnExists($conn, 'seats', 'reserved_by')
+        || !seatSystemColumnExists($conn, 'seats', 'seat_number')
+    ) {
+        return [];
+    }
+
+    $stmt = $conn->prepare("SELECT seat_number FROM seats WHERE reserved_by = ? AND status='reserved' ORDER BY id");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    $labels = [];
+    while ($row = $result->fetch_assoc()) {
+        $label = trim((string) ($row['seat_number'] ?? ''));
+        if ($label !== '') {
+            $labels[] = $label;
+        }
+    }
+    $stmt->close();
+
+    return $labels;
+}
+
+function seatSystemSeatLabelsConfirmedByLatestTimeIn(mysqli $conn, int $userId, string $timeInAt): array
+{
+    if (
+        !seatSystemColumnExists($conn, 'seats', 'status')
+        || !seatSystemColumnExists($conn, 'seats', 'reserved_by')
+        || !seatSystemColumnExists($conn, 'seats', 'reserved_at')
+        || !seatSystemColumnExists($conn, 'seats', 'expires_at')
+        || !seatSystemColumnExists($conn, 'seats', 'seat_number')
+    ) {
+        return [];
+    }
+
+    $where = "reserved_by = ? AND status='reserved' AND reserved_at IS NOT NULL AND reserved_at <= ? AND expires_at IS NULL";
+    if (seatSystemColumnExists($conn, 'seats', 'reservation_status')) {
+        $where .= " AND reservation_status='confirmed'";
+    }
+
+    $stmt = $conn->prepare('SELECT seat_number FROM seats WHERE ' . $where . ' ORDER BY id');
+    $stmt->bind_param('is', $userId, $timeInAt);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    $labels = [];
+    while ($row = $result->fetch_assoc()) {
+        $label = trim((string) ($row['seat_number'] ?? ''));
+        if ($label !== '') {
+            $labels[] = $label;
+        }
+    }
+    $stmt->close();
+
+    return $labels;
+}
+
+function seatSystemLookupUserContact(mysqli $conn, int $userId): ?array
+{
+    $stmt = $conn->prepare('SELECT username, email FROM users WHERE id = ? LIMIT 1');
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $stmt->bind_result($username, $email);
+    $found = $stmt->fetch();
+    $stmt->close();
+
+    if (!$found) {
+        return null;
+    }
+
+    $email = trim((string) $email);
+    if ($email === '') {
+        return null;
+    }
+
+    $name = trim((string) $username);
+    if ($name === '') {
+        $name = 'Student';
+    }
+
+    return ['name' => $name, 'email' => $email];
+}
+
+function seatSystemNormalizeSeatLabelsForEmailKey(array $seatLabels): array
+{
+    $labels = array_values(array_unique(array_filter(array_map(
+        static fn($v): string => trim((string) $v),
+        $seatLabels
+    ), static fn(string $v): bool => $v !== '')));
+
+    sort($labels, SORT_NATURAL | SORT_FLAG_CASE);
+    return $labels;
+}
+
+function seatSystemSeatConfirmedEmailKey(int $userId, array $seatLabels, string $timeInAt): string
+{
+    $labels = seatSystemNormalizeSeatLabelsForEmailKey($seatLabels);
+    return hash('sha256', $userId . '|' . trim($timeInAt) . '|' . implode('|', $labels));
+}
+
+function seatSystemSeatConfirmedEmailFlagPath(string $emailKey): string
+{
+    $tmpDir = rtrim((string) sys_get_temp_dir(), '\\/' . DIRECTORY_SEPARATOR);
+    if ($tmpDir === '') {
+        $tmpDir = __DIR__;
+    }
+
+    return $tmpDir . DIRECTORY_SEPARATOR . 'scc_seat_confirm_' . $emailKey . '.flag';
+}
+
+function seatSystemSeatConfirmedEmailWasSent(string $emailKey): bool
+{
+    return is_file(seatSystemSeatConfirmedEmailFlagPath($emailKey));
+}
+
+function seatSystemSeatConfirmedEmailMarkSent(string $emailKey): void
+{
+    @file_put_contents(seatSystemSeatConfirmedEmailFlagPath($emailKey), date('c'));
+}
+
+function seatSystemSendSeatConfirmedEmail(
+    mysqli $conn,
+    int $userId,
+    array $pendingSeatLabels,
+    string $timeInAt = ''
+): void
+{
+    if (!function_exists('sendSeatConfirmedEmail')) {
+        return;
+    }
+
+    $contact = seatSystemLookupUserContact($conn, $userId);
+    if ($contact === null) {
+        return;
+    }
+
+    $seatLabels = $pendingSeatLabels;
+    if (empty($seatLabels)) {
+        $seatLabels = seatSystemCurrentSeatLabelsForUser($conn, $userId);
+    }
+    if (empty($seatLabels)) {
+        return;
+    }
+
+    $timeInAt = trim($timeInAt);
+    if ($timeInAt === '') {
+        $timeInAt = date('Y-m-d H:i:s');
+    }
+
+    $emailKey = seatSystemSeatConfirmedEmailKey($userId, $seatLabels, $timeInAt);
+    if (seatSystemSeatConfirmedEmailWasSent($emailKey)) {
+        return;
+    }
+
+    $sent = sendSeatConfirmedEmail(
+        $contact['email'],
+        $contact['name'],
+        $seatLabels,
+        'Study Area - Library'
+    );
+
+    if (!$sent) {
+        error_log('[SeatSystem] Seat confirmed email returned false for user ID ' . $userId);
+        return;
+    }
+
+    seatSystemSeatConfirmedEmailMarkSent($emailKey);
+}
+
 function seatSystemReleaseUserAllocationsInTable(mysqli $conn, string $table, int $userId): int
 {
     if (!seatSystemColumnExists($conn, $table, 'reserved_by')) {
@@ -187,10 +415,40 @@ function seatSystemSyncAllocationsByAttendance(mysqli $conn, int $userId): array
 {
     $latestAction = seatSystemLatestAttendanceActionToday($conn, $userId);
     if ($latestAction === 'TIME_IN') {
+        $latestTimeInAt = seatSystemLatestTimeInAtToday($conn, $userId);
+        $pendingSeatLabels = [];
+        try {
+            $pendingSeatLabels = seatSystemPendingSeatLabelsForUser($conn, $userId);
+        } catch (Throwable $e) {
+            error_log('[SeatSystem] Pending seat lookup failed: ' . $e->getMessage());
+        }
+
+        $confirmedSeats = seatSystemConfirmPendingForUserInTable($conn, 'seats', $userId);
+        $confirmedComputers = seatSystemConfirmPendingForUserInTable($conn, 'computers', $userId);
+
+        $confirmEmailSeatLabels = [];
+        if ($confirmedSeats > 0) {
+            $confirmEmailSeatLabels = $pendingSeatLabels;
+        } elseif ($latestTimeInAt !== '') {
+            try {
+                $confirmEmailSeatLabels = seatSystemSeatLabelsConfirmedByLatestTimeIn($conn, $userId, $latestTimeInAt);
+            } catch (Throwable $e) {
+                error_log('[SeatSystem] Confirmed-seat fallback lookup failed: ' . $e->getMessage());
+            }
+        }
+
+        if (!empty($confirmEmailSeatLabels)) {
+            try {
+                seatSystemSendSeatConfirmedEmail($conn, $userId, $confirmEmailSeatLabels, $latestTimeInAt);
+            } catch (Throwable $e) {
+                error_log('[SeatSystem] Seat confirmed email failed: ' . $e->getMessage());
+            }
+        }
+
         return [
             'timed_in' => true,
-            'confirmed_seats' => seatSystemConfirmPendingForUserInTable($conn, 'seats', $userId),
-            'confirmed_computers' => seatSystemConfirmPendingForUserInTable($conn, 'computers', $userId),
+            'confirmed_seats' => $confirmedSeats,
+            'confirmed_computers' => $confirmedComputers,
             'released_seats' => 0,
             'released_computers' => 0,
         ];
@@ -810,9 +1068,10 @@ function seatButton(?array $seat, bool $forceDisabled = false): string
     global $user_id, $csrfToken;
 
     $isMine = ((int)$seat['reserved_by'] === $user_id);
+    $isPending = ($seat['status'] === 'reserved' && !empty($seat['expires_at']));
     $cls    = 'seat-button';
 
-    if ($isMine && !empty($seat['expires_at'])) {
+    if ($isPending) {
         $cls .= ' pending-confirmation';
     } elseif ($isMine) {
         $cls .= ' reserved-by-you';
@@ -848,9 +1107,10 @@ function computerButton(?array $comp): string
     global $user_id, $csrfToken;
 
     $isMine = ((int)$comp['reserved_by'] === $user_id);
+    $isPending = ($comp['status'] === 'reserved' && !empty($comp['expires_at']));
     $cls    = 'computer-button';
 
-    if ($isMine && !empty($comp['expires_at'])) {
+    if ($isPending) {
         $cls .= ' pending-confirmation';
     } elseif ($isMine) {
         $cls .= ' reserved-by-you';
@@ -1817,7 +2077,7 @@ body {
     <span id="attendanceStatusText">
         <?= $userTimedInNow
                 ? 'RFID status: TIME_IN. Any pending reservation is now confirmed.'
-                : 'RFID status: TIME_OUT. You can reserve now, then tap TIME_IN within 15 minutes to confirm.' ?>
+                : 'RFID status: Not timed in yet. You can reserve now, then tap TIME_IN within 15 minutes to confirm.' ?>
     </span>
 </div>
 
@@ -2095,7 +2355,7 @@ function syncAttendanceStatus(isTimedIn) {
     attendanceStatus.classList.toggle('out', !isTimedIn);
     attendanceStatusText.textContent = isTimedIn
         ? 'RFID status: TIME_IN. Any pending reservation is now confirmed.'
-    : 'RFID status: TIME_OUT. You can reserve now, then tap TIME_IN within 15 minutes to confirm.';
+    : 'RFID status: Not timed in yet. You can reserve now, then tap TIME_IN within 15 minutes to confirm.';
 }
 
 syncAttendanceStatus(userTimedIn);
@@ -2150,15 +2410,15 @@ function syncButtons(seatsData, compsData) {
 
 function applyButtonState(btn, status, reservedBy, expiresAt, type) {
     const isMine  = (parseInt(reservedBy) === MY_USER);
-    const isTaken = (status !== 'available' && !isMine);
-    const isPendingMine = isMine && !!expiresAt;
+    const isPending = (status === 'reserved' && !!expiresAt);
+    const isTaken = (status !== 'available' && !isMine && !isPending);
     const forceDisabled = (btn.dataset.forceDisabled === '1');
 
-    btn.classList.toggle('reserved-by-you', isMine && !isPendingMine);
-    btn.classList.toggle('pending-confirmation', isPendingMine);
+    btn.classList.toggle('reserved-by-you', isMine && !isPending);
+    btn.classList.toggle('pending-confirmation', isPending);
     btn.classList.toggle('taken',           isTaken);
 
-    btn.disabled = forceDisabled || isTaken;
+    btn.disabled = forceDisabled || (status !== 'available' && !isMine);
     btn.dataset.action = isMine ? 'release' : 'reserve';
 }
 

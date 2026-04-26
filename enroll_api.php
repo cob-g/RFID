@@ -144,22 +144,34 @@ function enrollApiFindUserByUsername(mysqli $conn, string $username): ?array
         return null;
     }
 
-    if (array_key_exists($username, $cache)) {
-        return $cache[$username];
+    // Normalize cache key so the same identifier in different casing
+    // does not trigger duplicate lookups.
+    $cacheKey = strtolower($username);
+    if (array_key_exists($cacheKey, $cache)) {
+        return $cache[$cacheKey];
     }
 
-    $stmt = $conn->prepare('SELECT id, username FROM users WHERE username = ? LIMIT 1');
-    $stmt->bind_param('s', $username);
+    $usersHasEmail = enrollApiColumnExists($conn, 'users', 'email');
+    if ($usersHasEmail) {
+        $stmt = $conn->prepare(
+            'SELECT id, username FROM users WHERE username = ? OR email = ? LIMIT 1'
+        );
+        $stmt->bind_param('ss', $username, $username);
+    } else {
+        $stmt = $conn->prepare('SELECT id, username FROM users WHERE username = ? LIMIT 1');
+        $stmt->bind_param('s', $username);
+    }
+
     $stmt->execute();
     $stmt->bind_result($userId, $canonicalUsername);
     $found = $stmt->fetch();
     $stmt->close();
 
-    $cache[$username] = $found
+    $cache[$cacheKey] = $found
         ? ['id' => (int) $userId, 'username' => (string) $canonicalUsername]
         : null;
 
-    return $cache[$username];
+    return $cache[$cacheKey];
 }
 
 function enrollApiExpireTokens(mysqli $conn, array $schema): void
