@@ -3,6 +3,13 @@ include 'auth.php';
 requireRole('admin', 'superadmin');
 include 'db.php';
 
+enforceOperatingHoursPageGate(
+    $conn,
+    ['admin'],
+    'Admin Access Temporarily Closed',
+    'Admin account management is available only during operating hours.'
+);
+
 if (!isset($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }

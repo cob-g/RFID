@@ -4,6 +4,13 @@ requireLogin();
 requireRole('admin', 'superadmin');
 require_once 'db.php';
 
+enforceOperatingHoursPageGate(
+    $conn,
+    ['admin'],
+    'Admin Access Temporarily Closed',
+    'Reservation release actions are available only during operating hours.'
+);
+
 
 if (!isset($_GET['type'], $_GET['id'], $_GET['csrf'])) {
     http_response_code(400);

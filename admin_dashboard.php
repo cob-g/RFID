@@ -9,9 +9,77 @@ if (!isset($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
 
-$current_role = $_SESSION['role'];
+$current_role = strtolower((string) ($_SESSION['role'] ?? ''));
+$isSuperadmin = ($current_role === 'superadmin');
+$currentUserId = (int) ($_SESSION['user_id'] ?? 0);
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_system_hours'])) {
+    if (!$isSuperadmin) {
+        $_SESSION['error'] = 'Only superadmin can update system hours.';
+        header('Location: admin_dashboard.php?tab=dashboard');
+        exit;
+    }
+
+    $csrf = (string) ($_POST['csrf'] ?? '');
+    if (!verifyCsrf($csrf)) {
+        $_SESSION['error'] = 'Invalid request token. Please refresh and try again.';
+        header('Location: admin_dashboard.php?tab=system-hours');
+        exit;
+    }
+
+    $openTimeRaw = (string) ($_POST['open_time'] ?? '');
+    $closeTimeRaw = (string) ($_POST['close_time'] ?? '');
+    $openTime = libraryHoursNormalizeTimeInput($openTimeRaw);
+    $closeTime = libraryHoursNormalizeTimeInput($closeTimeRaw);
+
+    if ($openTime === null || $closeTime === null) {
+        $_SESSION['error'] = 'Please provide valid opening and closing times.';
+        header('Location: admin_dashboard.php?tab=system-hours');
+        exit;
+    }
+
+    try {
+        libraryHoursSetConfig($conn, $openTime, $closeTime, $currentUserId > 0 ? $currentUserId : null);
+        $_SESSION['success'] = 'System hours updated successfully.';
+    } catch (InvalidArgumentException $e) {
+        $_SESSION['error'] = $e->getMessage();
+    } catch (Throwable $e) {
+        error_log('[admin_dashboard/system_hours] ' . $e->getMessage());
+        $_SESSION['error'] = 'Unable to update system hours right now. Please try again.';
+    }
+
+    header('Location: admin_dashboard.php?tab=system-hours');
+    exit;
+}
+
+$hoursState = libraryHoursEvaluate($conn);
+if ($current_role === 'admin' && !$hoursState['is_open']) {
+    libraryHoursRenderClosedPage(
+        $conn,
+        'Admin Access Temporarily Closed',
+        'Admin actions are available only during operating hours.',
+        403,
+        $hoursState
+    );
+}
+
+$hoursConfig = (array) ($hoursState['config'] ?? libraryHoursGetConfig($conn));
+$hoursNotice = libraryHoursBuildNotice($hoursState);
+$hoursOpenTime = (string) ($hoursConfig['open_time'] ?? LIBRARY_HOURS_DEFAULT_OPEN);
+$hoursCloseTime = (string) ($hoursConfig['close_time'] ?? LIBRARY_HOURS_DEFAULT_CLOSE);
+$hoursOpenInput = substr($hoursOpenTime, 0, 5);
+$hoursCloseInput = substr($hoursCloseTime, 0, 5);
+$hoursStatusText = $hoursState['is_open'] ? 'Open now' : 'Closed now';
+$hoursStatusClass = $hoursState['is_open'] ? 'available' : 'reserved';
+$hoursNextOpenDisplay = (string) ($hoursNotice['reopen_display'] ?? '');
+if ($hoursNextOpenDisplay === '') {
+    $hoursNextOpenDisplay = 'Reopening time unavailable';
+}
 
 $allowedInitialTabs = ['dashboard', 'users', 'seats', 'computers', 'rfid-portal'];
+if ($isSuperadmin) {
+    $allowedInitialTabs[] = 'system-hours';
+}
 $initialTab = 'dashboard';
 
 $requestedTab = trim((string) ($_GET['tab'] ?? ''));
@@ -737,6 +805,82 @@ tbody tr:last-child td { border-bottom: none; }
     padding: 32px;
 }
 
+.table-pagination {
+    border-top: 1px solid rgba(200,169,110,0.12);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 16px 14px;
+    flex-wrap: wrap;
+}
+
+.pagination-meta {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    letter-spacing: 0.02em;
+}
+
+.pagination-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: auto;
+}
+
+.pagination-pages {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.page-btn,
+.page-number {
+    appearance: none;
+    border: 1px solid var(--glass-border);
+    background: rgba(255,255,255,0.05);
+    color: var(--text-sub);
+    border-radius: 9px;
+    min-width: 34px;
+    height: 32px;
+    padding: 0 10px;
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background var(--transition), border-color var(--transition), color var(--transition), transform var(--transition);
+}
+
+.page-btn:hover:not(:disabled),
+.page-number:hover:not(:disabled) {
+    background: rgba(200,169,110,0.16);
+    border-color: rgba(200,169,110,0.40);
+    color: var(--gold-light);
+    transform: translateY(-1px);
+}
+
+.page-btn:disabled,
+.page-number:disabled {
+    opacity: 0.42;
+    cursor: not-allowed;
+    transform: none;
+}
+
+.page-number.active,
+.page-number[aria-current='page'] {
+    background: linear-gradient(135deg, rgba(200,169,110,0.90) 0%, rgba(160,120,64,0.90) 100%);
+    border-color: rgba(200,169,110,0.75);
+    color: #1a1208;
+    cursor: default;
+}
+
+.page-ellipsis {
+    color: var(--text-muted);
+    font-size: 0.86rem;
+    padding: 0 2px;
+    user-select: none;
+}
+
 .rfid-actions-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
@@ -875,6 +1019,101 @@ tbody tr:last-child td { border-bottom: none; }
     background: rgba(10, 14, 20, 0.72);
 }
 
+.hours-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+    margin-bottom: 14px;
+}
+
+.hours-card {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
+    padding: 14px;
+}
+
+.hours-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+}
+
+.hours-value {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 1.45rem;
+    color: var(--gold-light);
+    line-height: 1.1;
+}
+
+.hours-form {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-lg);
+    padding: 16px;
+}
+
+.hours-input-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.hours-input-group label {
+    display: block;
+    font-size: 0.78rem;
+    color: var(--text-sub);
+    margin-bottom: 6px;
+}
+
+.hours-input-group input[type='time'] {
+    width: 100%;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--glass-border);
+    border-radius: 8px;
+    color: var(--text-main);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.9rem;
+    padding: 10px 11px;
+}
+
+.hours-input-group input[type='time']:focus {
+    outline: none;
+    border-color: rgba(200, 169, 110, 0.50);
+    box-shadow: 0 0 0 3px rgba(200, 169, 110, 0.16);
+}
+
+.hours-help {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    line-height: 1.5;
+    margin-bottom: 12px;
+}
+
+.hours-submit {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 10px 14px;
+    border-radius: 9px;
+    border: 1px solid rgba(200, 169, 110, 0.38);
+    background: rgba(200, 169, 110, 0.14);
+    color: var(--gold-light);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.82rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all var(--transition);
+}
+
+.hours-submit:hover {
+    background: rgba(200, 169, 110, 0.22);
+    border-color: rgba(200, 169, 110, 0.55);
+}
+
 /* ═══════════════════════════════════════════
    RESPONSIVE
 ═══════════════════════════════════════════ */
@@ -889,6 +1128,9 @@ tbody tr:last-child td { border-bottom: none; }
     .page-header-text h1 { font-size: 1.5rem; }
     th, td { padding: 10px 12px; }
     .rfid-frame { min-height: 640px; }
+    .table-pagination { padding: 10px 12px 14px; }
+    .pagination-controls { width: 100%; justify-content: space-between; margin-left: 0; }
+    .pagination-pages { flex: 1; justify-content: center; }
 }
 
 @media (max-width: 380px) {
@@ -938,6 +1180,11 @@ tbody tr:last-child td { border-bottom: none; }
         <button class="tab-button <?= $initialTab === 'rfid-portal' ? 'active' : '' ?>" data-tab="rfid-portal">
             <span class="nav-icon">📡</span> RFID Portal
         </button>
+        <?php if ($isSuperadmin): ?>
+        <button class="tab-button <?= $initialTab === 'system-hours' ? 'active' : '' ?>" data-tab="system-hours">
+            <span class="nav-icon">⏰</span> System Hours
+        </button>
+        <?php endif; ?>
     </div>
 
     <div class="sidebar-footer">
@@ -1093,7 +1340,7 @@ tbody tr:last-child td { border-bottom: none; }
 
             <div class="table-wrap">
                 <div class="table-scroll">
-                    <table>
+                    <table id="seatAllocationTable">
                         <thead>
                             <tr>
                                 <th>Seat Number</th>
@@ -1102,13 +1349,13 @@ tbody tr:last-child td { border-bottom: none; }
                                 <th>Action</th>
                             </tr>
                         </thead>
-                        <tbody>
+                        <tbody id="seatAllocationBody">
                             <?php
                             $hasRows = false;
                             while ($row = mysqli_fetch_assoc($seats_query)):
                                 $hasRows = true;
                             ?>
-                            <tr>
+                            <tr class="seat-row">
                                 <td style="font-weight:600; color:var(--text-main);">
                                     🪑 <?= htmlspecialchars($row['seat_number']) ?>
                                 </td>
@@ -1133,6 +1380,14 @@ tbody tr:last-child td { border-bottom: none; }
                             <?php endif; ?>
                         </tbody>
                     </table>
+                </div>
+                <div class="table-pagination" id="seatPagination" hidden>
+                    <div class="pagination-meta" id="seatPaginationMeta"></div>
+                    <div class="pagination-controls">
+                        <button type="button" class="page-btn" id="seatPrevPage" aria-label="Previous seat page">Prev</button>
+                        <div class="pagination-pages" id="seatPaginationPages" aria-label="Seat page list"></div>
+                        <button type="button" class="page-btn" id="seatNextPage" aria-label="Next seat page">Next</button>
+                    </div>
                 </div>
             </div>
         </section>
@@ -1240,6 +1495,57 @@ tbody tr:last-child td { border-bottom: none; }
             </div>
         </section>
 
+        <?php if ($isSuperadmin): ?>
+        <section id="system-hours" class="section <?= $initialTab === 'system-hours' ? 'active' : '' ?>">
+            <div class="section-title">System Operating Hours</div>
+
+            <div class="hours-grid">
+                <div class="hours-card">
+                    <div class="hours-label">Current Status</div>
+                    <div class="hours-value">
+                        <span class="badge <?= $hoursStatusClass ?>"><?= htmlspecialchars($hoursStatusText) ?></span>
+                    </div>
+                </div>
+                <div class="hours-card">
+                    <div class="hours-label">Schedule</div>
+                    <div class="hours-value"><?= htmlspecialchars(libraryHoursFormatTime($hoursOpenTime)) ?> - <?= htmlspecialchars(libraryHoursFormatTime($hoursCloseTime)) ?></div>
+                </div>
+                <div class="hours-card">
+                    <div class="hours-label">Next Opening</div>
+                    <div class="hours-value" style="font-size:1.15rem;"><?= htmlspecialchars($hoursNextOpenDisplay) ?></div>
+                </div>
+            </div>
+
+            <div class="welcome-box" style="margin-bottom:14px;">
+                Sunday is permanently closed. Only superadmin can edit opening and closing times.
+                <br>
+                <?= htmlspecialchars((string) ($hoursNotice['hours_line'] ?? '')) ?>
+            </div>
+
+            <form method="POST" class="hours-form" autocomplete="off">
+                <input type="hidden" name="csrf" value="<?= htmlspecialchars((string) $_SESSION['csrf_token']) ?>">
+                <input type="hidden" name="save_system_hours" value="1">
+
+                <div class="hours-input-row">
+                    <div class="hours-input-group">
+                        <label for="open_time">Opening Time (Monday-Saturday)</label>
+                        <input id="open_time" name="open_time" type="time" step="60" value="<?= htmlspecialchars($hoursOpenInput) ?>" required>
+                    </div>
+                    <div class="hours-input-group">
+                        <label for="close_time">Closing Time (Monday-Saturday)</label>
+                        <input id="close_time" name="close_time" type="time" step="60" value="<?= htmlspecialchars($hoursCloseInput) ?>" required>
+                    </div>
+                </div>
+
+                <div class="hours-help">
+                    Changes apply globally to admin, librarian, assistant, faculty, and student access. Superadmin remains exempt from closed-hour restrictions.
+                </div>
+
+                <button type="submit" class="hours-submit">Save Operating Hours</button>
+            </form>
+        </section>
+        <?php endif; ?>
+
     </div><!-- /main-content -->
 </div><!-- /flex col -->
 </div><!-- /wrapper -->
@@ -1262,6 +1568,145 @@ buttons.forEach(btn => {
         closeSidebar();
     });
 });
+
+/* ── Seat pagination ── */
+const seatPagination = document.getElementById('seatPagination');
+const seatPaginationMeta = document.getElementById('seatPaginationMeta');
+const seatPaginationPages = document.getElementById('seatPaginationPages');
+const seatPrevPage = document.getElementById('seatPrevPage');
+const seatNextPage = document.getElementById('seatNextPage');
+const seatRows = Array.from(document.querySelectorAll('#seatAllocationBody .seat-row'));
+
+const SEAT_ROWS_PER_PAGE = 10;
+let seatCurrentPage = 1;
+const seatTotalPages = Math.max(1, Math.ceil(seatRows.length / SEAT_ROWS_PER_PAGE));
+
+function clampSeatPage(page) {
+    return Math.max(1, Math.min(seatTotalPages, page));
+}
+
+function seatPageTokens(totalPages, currentPage) {
+    if (totalPages <= 7) {
+        return Array.from({ length: totalPages }, (_, idx) => idx + 1);
+    }
+
+    const tokens = [1];
+    const start = Math.max(2, currentPage - 1);
+    const end = Math.min(totalPages - 1, currentPage + 1);
+
+    if (start > 2) {
+        tokens.push('ellipsis-left');
+    }
+
+    for (let page = start; page <= end; page += 1) {
+        tokens.push(page);
+    }
+
+    if (end < totalPages - 1) {
+        tokens.push('ellipsis-right');
+    }
+
+    tokens.push(totalPages);
+    return tokens;
+}
+
+function syncSeatPageUrl() {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('tab') !== 'seats') {
+        return;
+    }
+
+    if (seatCurrentPage > 1) {
+        params.set('seatPage', String(seatCurrentPage));
+    } else {
+        params.delete('seatPage');
+    }
+
+    const query = params.toString();
+    const nextUrl = window.location.pathname + (query ? ('?' + query) : '');
+    window.history.replaceState(null, '', nextUrl);
+}
+
+function renderSeatPaginationPages() {
+    if (!seatPaginationPages) return;
+
+    seatPaginationPages.innerHTML = '';
+    seatPageTokens(seatTotalPages, seatCurrentPage).forEach(token => {
+        if (typeof token !== 'number') {
+            const dots = document.createElement('span');
+            dots.className = 'page-ellipsis';
+            dots.textContent = '…';
+            dots.setAttribute('aria-hidden', 'true');
+            seatPaginationPages.appendChild(dots);
+            return;
+        }
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'page-number' + (token === seatCurrentPage ? ' active' : '');
+        btn.textContent = String(token);
+        btn.setAttribute('aria-label', 'Go to seat page ' + token);
+
+        if (token === seatCurrentPage) {
+            btn.setAttribute('aria-current', 'page');
+            btn.disabled = true;
+        } else {
+            btn.addEventListener('click', () => setSeatPage(token));
+        }
+
+        seatPaginationPages.appendChild(btn);
+    });
+}
+
+function setSeatPage(page) {
+    seatCurrentPage = clampSeatPage(page);
+
+    const startIndex = (seatCurrentPage - 1) * SEAT_ROWS_PER_PAGE;
+    const endIndex = startIndex + SEAT_ROWS_PER_PAGE;
+
+    seatRows.forEach((row, idx) => {
+        row.hidden = !(idx >= startIndex && idx < endIndex);
+    });
+
+    const firstLabel = seatRows.length === 0 ? 0 : (startIndex + 1);
+    const lastLabel = Math.min(endIndex, seatRows.length);
+
+    if (seatPaginationMeta) {
+        seatPaginationMeta.textContent = 'Showing ' + firstLabel + '-' + lastLabel + ' of ' + seatRows.length + ' seats';
+    }
+    if (seatPrevPage) seatPrevPage.disabled = seatCurrentPage <= 1;
+    if (seatNextPage) seatNextPage.disabled = seatCurrentPage >= seatTotalPages;
+
+    renderSeatPaginationPages();
+    syncSeatPageUrl();
+}
+
+function initSeatPagination() {
+    if (!seatPagination || seatRows.length === 0) {
+        return;
+    }
+
+    if (seatRows.length <= SEAT_ROWS_PER_PAGE) {
+        seatPagination.hidden = true;
+        return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const parsedPage = parseInt(params.get('seatPage') || '1', 10);
+    seatCurrentPage = Number.isFinite(parsedPage) ? clampSeatPage(parsedPage) : 1;
+
+    seatPagination.hidden = false;
+    if (seatPrevPage) {
+        seatPrevPage.addEventListener('click', () => setSeatPage(seatCurrentPage - 1));
+    }
+    if (seatNextPage) {
+        seatNextPage.addEventListener('click', () => setSeatPage(seatCurrentPage + 1));
+    }
+
+    setSeatPage(seatCurrentPage);
+}
+
+initSeatPagination();
 
 const RFID_PROXY_URL = 'rfid_portal_proxy.php';
 const CSRF_TOKEN = '<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>';

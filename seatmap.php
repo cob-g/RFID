@@ -24,6 +24,39 @@ if (empty($_SESSION['user_id'])) {
 
 $user_id       = (int) $_SESSION['user_id'];
 $isAjaxRequest = ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax']));
+$isPollRequest = ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['poll']));
+
+$hoursState = libraryHoursEvaluate($conn);
+if (!$hoursState['is_open']) {
+    $closedPayload = operatingHoursClosedApiPayload(
+        $conn,
+        'Seat and computer allocation is unavailable while the library is closed.',
+        $hoursState
+    );
+
+    if ($isAjaxRequest || $isPollRequest) {
+        while (ob_get_level()) {
+            ob_end_clean();
+        }
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode([
+            'success' => false,
+            'closed' => true,
+            'message' => $closedPayload['msg'],
+            'reopens_at' => $closedPayload['reopens_at'],
+            'hours' => $closedPayload['hours'],
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+
+    libraryHoursRenderClosedPage(
+        $conn,
+        'Library Access Temporarily Closed',
+        'Student and faculty access is unavailable outside operating hours.',
+        403,
+        $hoursState
+    );
+}
 
 const RESERVATION_CONFIRM_WINDOW_MINUTES = 15;
 
@@ -668,14 +701,13 @@ if ($isAjaxRequest) {
             }
 
             if (!$isRelease) {
-                // Temporarily disabled daily reservation limit for testing.
-                // if (seatSystemHasReservedToday($conn, $user_id)) {
-                //     $conn->rollback();
-                //     jsonResponse([
-                //         'success' => false,
-                //         'message' => 'Daily limit reached: you can reserve only once per day.',
-                //     ]);
-                // }
+                if (seatSystemHasReservedToday($conn, $user_id)) {
+                    $conn->rollback();
+                    jsonResponse([
+                        'success' => false,
+                        'message' => 'Daily limit reached: you can reserve only once per day. Please come back tomorrow.',
+                    ]);
+                }
 
                 $limitStmt = $conn->prepare(
                     'SELECT
@@ -873,14 +905,13 @@ if ($isAjaxRequest) {
             }
 
             if (!$isRelease) {
-                // Temporarily disabled daily reservation limit for testing.
-                // if (seatSystemHasReservedToday($conn, $user_id)) {
-                //     $conn->rollback();
-                //     jsonResponse([
-                //         'success' => false,
-                //         'message' => 'Daily limit reached: you can reserve only once per day.',
-                //     ]);
-                // }
+                if (seatSystemHasReservedToday($conn, $user_id)) {
+                    $conn->rollback();
+                    jsonResponse([
+                        'success' => false,
+                        'message' => 'Daily limit reached: you can reserve only once per day. Please come back tomorrow.',
+                    ]);
+                }
 
                 $limitStmt = $conn->prepare(
                     'SELECT
@@ -1449,8 +1480,8 @@ body {
 .right-panel {
     flex: 1;
     display: grid;
-    grid-template-columns: 1fr 278px;
-    gap: 0 20px;
+    grid-template-columns: minmax(0, 1fr) clamp(270px, 21vw, 312px);
+    gap: 0 clamp(16px, 2vw, 30px);
     padding: 26px 24px 90px 26px;
     align-items: start;
     overflow-y: auto;
@@ -1462,8 +1493,8 @@ body {
     display: flex;
     flex-direction: column;
     width: 100%;
-    max-width: 1080px;
-    margin: 0 auto;
+    max-width: none;
+    margin: 0;
 }
 
 .ct-sidebar {
@@ -1471,6 +1502,9 @@ body {
     top: 26px;
     bottom: auto;
     align-self: start;
+    justify-self: end;
+    width: 100%;
+    max-width: 312px;
     max-height: calc(100vh - 120px);
     display: flex;
     flex-direction: column;
@@ -1540,6 +1574,68 @@ body {
     margin-bottom: 14px;
     padding-bottom: 6px;
     border-bottom: 1px solid var(--gold-dim);
+}
+
+.collapsible-section {
+    margin-bottom: 16px;
+}
+
+.section-toggle {
+    width: 100%;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    background: transparent;
+    color: inherit;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    text-align: left;
+    cursor: pointer;
+    padding: 0;
+    margin-bottom: 12px;
+}
+
+.section-toggle:focus-visible {
+    outline: 2px solid rgba(200, 169, 110, 0.55);
+    outline-offset: 3px;
+}
+
+.section-toggle .section-title {
+    margin-bottom: 0;
+    flex: 1;
+}
+
+.section-toggle-icon {
+    font-size: 0.86rem;
+    color: var(--gold-light);
+    transition: transform var(--transition), color var(--transition);
+    margin-top: -4px;
+    padding: 0 4px;
+}
+
+.section-toggle:hover .section-toggle-icon {
+    color: var(--gold);
+}
+
+.collapsible-section.is-collapsed .section-toggle {
+    margin-bottom: 0;
+}
+
+.collapsible-section.is-collapsed .section-toggle-icon {
+    transform: rotate(-90deg);
+}
+
+.collapsible-content {
+    width: 100%;
+    overflow: hidden;
+    transform-origin: top center;
+    opacity: 1;
+    transform: translateY(0) scaleY(1);
+}
+
+.collapsible-content.is-animating {
+    will-change: height, opacity, transform;
 }
 
 .table-card {
@@ -1618,10 +1714,15 @@ body {
 }
 
 /* Top faculty table cards */
-.top-tables-row { display: flex; gap: 14px; margin-bottom: 20px; flex-wrap: wrap; }
+.top-tables-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 14px;
+    margin-bottom: 20px;
+}
 
 .top-table-card {
-    flex: 1; min-width: 154px;
+    min-width: 0;
     background: var(--glass-bg);
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-lg);
@@ -1748,10 +1849,12 @@ body {
 
 .seat-button.attendance-locked,
 .computer-button.attendance-locked {
-    background: rgba(255,255,255,0.10) !important;
-    color: var(--text-muted) !important;
-    box-shadow: none !important;
-    border: 1px solid var(--glass-border);
+    background: var(--seat-taken) !important;
+    color: #fff !important;
+    box-shadow: 0 2px 10px rgba(239, 68, 68, 0.42) !important;
+    border: 1px solid rgba(239, 68, 68, 0.48);
+    opacity: 0.95;
+    cursor: not-allowed;
 }
 
 .seat-button.loading,
@@ -2057,8 +2160,16 @@ body {
     .right-panel {
         grid-template-columns: 1fr;
         padding: 18px 14px 90px;
+        row-gap: 14px;
     }
-    .ct-sidebar { position: static; align-self: auto; max-height: none; margin-top: 14px; }
+    .ct-sidebar {
+        position: static;
+        align-self: auto;
+        justify-self: stretch;
+        max-width: none;
+        max-height: none;
+        margin-top: 0;
+    }
     .ct-card    { transform: none; }
 }
 @media (max-width: 680px) {
@@ -2166,77 +2277,102 @@ body {
 
     <div class="main-content">
 
-      <!-- Faculty tables -->
-      <div class="section-title">Faculty Tables</div>
-      <div class="top-tables-row">
-        <?php foreach ($topTables as $tName => $tSeats): ?>
-        <div class="top-table-card">
-          <div class="table-card-title"><?= htmlspecialchars($tName) ?></div>
-          <div class="vertical-table">
-            <div class="top-chair">
-              <?= isset($tSeats[2]) ? seatButton(getSeat($tSeats[2])) : '' ?>
-            </div>
-            <div class="middle-row">
-              <?= seatButton(getSeat($tSeats[0])) ?>
-              <div class="table-bar"></div>
-              <?= isset($tSeats[1]) ? seatButton(getSeat($tSeats[1])) : '' ?>
-            </div>
-          </div>
-        </div>
-        <?php endforeach; ?>
-      </div>
+            <section class="collapsible-section" data-collapsible-key="facultyTables" data-default-expanded="1">
+                <button type="button" class="section-toggle" aria-expanded="true" aria-controls="sectionFacultyTables">
+                    <span class="section-title">Faculty Tables</span>
+                    <span class="section-toggle-icon" aria-hidden="true">▾</span>
+                </button>
+                <div class="collapsible-content" id="sectionFacultyTables">
+                    <div class="top-tables-row">
+                        <?php foreach ($topTables as $tName => $tSeats): ?>
+                        <div class="top-table-card">
+                            <div class="table-card-title"><?= htmlspecialchars($tName) ?></div>
+                            <div class="vertical-table">
+                                <div class="top-chair">
+                                    <?= isset($tSeats[2]) ? seatButton(getSeat($tSeats[2])) : '' ?>
+                                </div>
+                                <div class="middle-row">
+                                    <?= seatButton(getSeat($tSeats[0])) ?>
+                                    <div class="table-bar"></div>
+                                    <?= isset($tSeats[1]) ? seatButton(getSeat($tSeats[1])) : '' ?>
+                                </div>
+                            </div>
+                        </div>
+                        <?php endforeach; ?>
+                    </div>
+                </div>
+            </section>
 
-      <!-- Study tables -->
-      <div class="section-title">Study Tables</div>
+            <section class="collapsible-section" data-collapsible-key="studyTables" data-default-expanded="0">
+                <button type="button" class="section-toggle" aria-expanded="false" aria-controls="sectionStudyTables">
+                    <span class="section-title">Study Tables</span>
+                    <span class="section-toggle-icon" aria-hidden="true">▾</span>
+                </button>
+                <div class="collapsible-content" id="sectionStudyTables" hidden>
 
-      <?php
-      $longTableLabels = ['E', 'D', 'C', 'B', 'A'];
-      foreach ($longTables as $index => $seatIds):
-          $label       = $longTableLabels[$index] ?? ($index + 1);
-          $topSeats    = array_slice($seatIds, 0, 4);
-          $bottomSeats = array_slice($seatIds, 4, 4);
-      ?>
-      <div class="long-table-card">
-        <div class="long-table-name">Long Table <?= htmlspecialchars((string)$label) ?></div>
-        <div class="horizontal-facing-layout">
-          <div class="horizontal-side">
-            <?php foreach ($topSeats    as $sid) echo seatButton(getSeat($sid)); ?>
-          </div>
-          <div class="horizontal-table-bar"></div>
-          <div class="horizontal-side">
-            <?php foreach ($bottomSeats as $sid) echo seatButton(getSeat($sid)); ?>
-          </div>
-        </div>
-      </div>
-      <?php endforeach; ?>
+                    <?php
+                    $longTableLabels = ['E', 'D', 'C', 'B', 'A'];
+                    foreach ($longTables as $index => $seatIds):
+                            $label       = $longTableLabels[$index] ?? ($index + 1);
+                            $topSeats    = array_slice($seatIds, 0, 4);
+                            $bottomSeats = array_slice($seatIds, 4, 4);
+                    ?>
+                    <div class="long-table-card">
+                        <div class="long-table-name">Long Table <?= htmlspecialchars((string)$label) ?></div>
+                        <div class="horizontal-facing-layout">
+                            <div class="horizontal-side">
+                                <?php foreach ($topSeats    as $sid) echo seatButton(getSeat($sid)); ?>
+                            </div>
+                            <div class="horizontal-table-bar"></div>
+                            <div class="horizontal-side">
+                                <?php foreach ($bottomSeats as $sid) echo seatButton(getSeat($sid)); ?>
+                            </div>
+                        </div>
+                    </div>
+                    <?php endforeach; ?>
 
-      <!-- Mixed table 1 -->
-      <div class="mixed-table-card">
-        <div class="mixed-table-name">Mixed Table 1</div>
-        <div class="mixed-layout">
-          <div class="mixed-row">
-            <?php foreach ($mixedTable1['seats']     as $sid) echo seatButton(getSeat($sid)); ?>
-          </div>
-          <div class="mixed-table-bar"></div>
-          <div class="mixed-row">
-            <?php foreach ($mixedTable1['computers'] as $cid) echo computerButton(getComputer($cid)); ?>
-          </div>
-        </div>
-      </div>
+                </div>
+            </section>
 
-      <!-- Mixed table 2 -->
-      <div class="mixed-table-card">
-        <div class="mixed-table-name">Mixed Table 2</div>
-        <div class="mixed-layout">
-          <div class="mixed-row">
-            <?php foreach ($mixedTable2['seats']     as $sid) echo seatButton(getSeat($sid)); ?>
-          </div>
-          <div class="mixed-table-bar"></div>
-          <div class="mixed-row">
-            <?php foreach ($mixedTable2['computers'] as $cid) echo computerButton(getComputer($cid)); ?>
-          </div>
-        </div>
-      </div>
+            <section class="collapsible-section" data-collapsible-key="mixedTable1" data-default-expanded="1">
+                <button type="button" class="section-toggle" aria-expanded="true" aria-controls="sectionMixedTable1">
+                    <span class="section-title">Mixed Table 1</span>
+                    <span class="section-toggle-icon" aria-hidden="true">▾</span>
+                </button>
+                <div class="collapsible-content" id="sectionMixedTable1">
+                    <div class="mixed-table-card">
+                        <div class="mixed-layout">
+                            <div class="mixed-row">
+                                <?php foreach ($mixedTable1['seats']     as $sid) echo seatButton(getSeat($sid)); ?>
+                            </div>
+                            <div class="mixed-table-bar"></div>
+                            <div class="mixed-row">
+                                <?php foreach ($mixedTable1['computers'] as $cid) echo computerButton(getComputer($cid)); ?>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="collapsible-section" data-collapsible-key="mixedTable2" data-default-expanded="0">
+                <button type="button" class="section-toggle" aria-expanded="false" aria-controls="sectionMixedTable2">
+                    <span class="section-title">Mixed Table 2</span>
+                    <span class="section-toggle-icon" aria-hidden="true">▾</span>
+                </button>
+                <div class="collapsible-content" id="sectionMixedTable2" hidden>
+                    <div class="mixed-table-card">
+                        <div class="mixed-layout">
+                            <div class="mixed-row">
+                                <?php foreach ($mixedTable2['seats']     as $sid) echo seatButton(getSeat($sid)); ?>
+                            </div>
+                            <div class="mixed-table-bar"></div>
+                            <div class="mixed-row">
+                                <?php foreach ($mixedTable2['computers'] as $cid) echo computerButton(getComputer($cid)); ?>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
 
     </div>
 
@@ -2367,6 +2503,10 @@ const drawerToggle    = document.getElementById('drawerToggle');
 const drawerOverlay   = document.getElementById('drawerOverlay');
 const mobileDrawer    = document.getElementById('mobileDrawer');
 const drawerClose     = document.getElementById('drawerClose');
+const collapsibleSections = Array.from(document.querySelectorAll('.collapsible-section'));
+const COLLAPSIBLE_STATE_KEY = 'seatmap.collapsible.v1';
+const COLLAPSIBLE_ANIM_MS = 360;
+const COLLAPSIBLE_ANIM_EASING = 'cubic-bezier(0.22, 1, 0.36, 1)';
 let userTimedIn       = <?= $userTimedInNow ? 'true' : 'false' ?>;
 
 function showModal(type, title, body, emailNote) {
@@ -2393,6 +2533,127 @@ function closeDrawer() { mobileDrawer.classList.remove('open'); drawerOverlay.cl
 drawerToggle.addEventListener('click', openDrawer);
 drawerClose.addEventListener('click', closeDrawer);
 drawerOverlay.addEventListener('click', e => { if (e.target === drawerOverlay) closeDrawer(); });
+
+function readCollapsibleState() {
+    try {
+        const raw = sessionStorage.getItem(COLLAPSIBLE_STATE_KEY);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (_) {
+        return {};
+    }
+}
+
+const collapsibleState = readCollapsibleState();
+
+function writeCollapsibleState() {
+    try {
+        sessionStorage.setItem(COLLAPSIBLE_STATE_KEY, JSON.stringify(collapsibleState));
+    } catch (_) {
+        // Ignore storage write failures (private mode/quota).
+    }
+}
+
+function prefersReducedMotion() {
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+function cleanupCollapsibleAnimation(content, section, expanded) {
+    if (content._collapsibleTransitionHandler) {
+        content.removeEventListener('transitionend', content._collapsibleTransitionHandler);
+        content._collapsibleTransitionHandler = null;
+    }
+
+    content.classList.remove('is-animating');
+    content.style.transition = '';
+    content.style.height = '';
+    content.style.opacity = '';
+    content.style.transform = '';
+    content.hidden = !expanded;
+    section.classList.toggle('is-collapsed', !expanded);
+}
+
+function animateSectionContent(section, content, expanded) {
+    const wasExpanded = !section.classList.contains('is-collapsed');
+    cleanupCollapsibleAnimation(content, section, wasExpanded);
+
+    const fromHeight = content.hidden ? 0 : content.getBoundingClientRect().height;
+
+    content.hidden = false;
+    section.classList.remove('is-collapsed');
+
+    const toHeight = expanded ? content.scrollHeight : 0;
+
+    content.classList.add('is-animating');
+    content.style.height = `${fromHeight}px`;
+    content.style.opacity = expanded ? '0' : '1';
+    content.style.transform = expanded ? 'translateY(-8px) scaleY(0.985)' : 'translateY(0) scaleY(1)';
+
+    void content.offsetHeight;
+
+    content.style.transition = [
+        `height ${COLLAPSIBLE_ANIM_MS}ms ${COLLAPSIBLE_ANIM_EASING}`,
+        `opacity ${Math.max(220, COLLAPSIBLE_ANIM_MS - 80)}ms ease`,
+        `transform ${COLLAPSIBLE_ANIM_MS}ms ${COLLAPSIBLE_ANIM_EASING}`,
+    ].join(', ');
+
+    content.style.height = `${toHeight}px`;
+    content.style.opacity = expanded ? '1' : '0';
+    content.style.transform = expanded ? 'translateY(0) scaleY(1)' : 'translateY(-8px) scaleY(0.985)';
+
+    const onTransitionEnd = function(evt) {
+        if (evt.target !== content || evt.propertyName !== 'height') return;
+        cleanupCollapsibleAnimation(content, section, expanded);
+    };
+
+    content._collapsibleTransitionHandler = onTransitionEnd;
+    content.addEventListener('transitionend', onTransitionEnd);
+}
+
+function setSectionExpanded(section, expanded, persist, immediate = false) {
+    const toggle = section.querySelector('.section-toggle');
+    const content = section.querySelector('.collapsible-content');
+    if (!toggle || !content) return;
+
+    toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+
+    if (immediate || prefersReducedMotion()) {
+        cleanupCollapsibleAnimation(content, section, expanded);
+    } else {
+        animateSectionContent(section, content, expanded);
+    }
+
+    if (!persist) return;
+
+    const key = section.dataset.collapsibleKey;
+    if (!key) return;
+
+    collapsibleState[key] = expanded;
+    writeCollapsibleState();
+}
+
+function initCollapsibleSections() {
+    collapsibleSections.forEach(section => {
+        const key = section.dataset.collapsibleKey;
+        const defaultExpanded = section.dataset.defaultExpanded !== '0';
+        const savedExpanded = key && Object.prototype.hasOwnProperty.call(collapsibleState, key)
+            ? !!collapsibleState[key]
+            : defaultExpanded;
+
+        setSectionExpanded(section, savedExpanded, false, true);
+
+        const toggle = section.querySelector('.section-toggle');
+        if (!toggle) return;
+
+        toggle.addEventListener('click', () => {
+            const currentlyExpanded = toggle.getAttribute('aria-expanded') === 'true';
+            setSectionExpanded(section, !currentlyExpanded, true);
+        });
+    });
+}
+
+initCollapsibleSections();
 
 function syncAttendanceStatus(isTimedIn) {
     attendanceStatus.classList.toggle('in', isTimedIn);
@@ -2479,6 +2740,13 @@ function poll() {
         .then(r => r.ok ? r.json() : null)
         .then(data => {
             if (!data) return;
+            if (data.closed) {
+                window.location.reload();
+                return;
+            }
+            if (!Array.isArray(data.seats) || !Array.isArray(data.computers)) {
+                return;
+            }
             lastPollData = data;
             if (typeof data.timed_in !== 'undefined') {
                 userTimedIn = !!data.timed_in;
@@ -2540,6 +2808,14 @@ function doFetch(formData, btn) {
     })
     .then(function(data) {
         btn.classList.remove('loading');
+
+        if (data && data.closed) {
+            showModal('error', 'Library Closed', data.message || 'Library access is currently closed.', null);
+            setTimeout(function() {
+                window.location.reload();
+            }, 1200);
+            return;
+        }
 
         if (data.success) {
             if (data.action === 'reserved') {

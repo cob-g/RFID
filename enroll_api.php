@@ -14,6 +14,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
 }
 
 require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/system_hours.php';
 
 function enrollApiRespond(array $payload, int $statusCode = 200): void
 {
@@ -943,6 +944,21 @@ function enrollApiHandleRequest(mysqli $conn, string $method, array $query, arra
     $action = $method === 'GET'
         ? strtolower(trim((string) ($query['action'] ?? '')))
         : strtolower(trim((string) ($body['action'] ?? ($query['action'] ?? ''))));
+
+    $closedRestrictedActions = ['enroll', 'delete', 'request', 'poll', 'submit', 'check'];
+    if (in_array($action, $closedRestrictedActions, true)) {
+        $hoursState = libraryHoursEvaluate($conn);
+        if (!$hoursState['is_open']) {
+            enrollApiRespond(
+                libraryHoursApiClosedPayload(
+                    $conn,
+                    'Enrollment services are unavailable while the library is closed.',
+                    $hoursState
+                )
+            );
+            return;
+        }
+    }
 
     switch ($action) {
         case 'enroll':

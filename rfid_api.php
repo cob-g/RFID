@@ -21,6 +21,7 @@ if (!in_array($method, ['GET', 'POST'], true)) {
 
 require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/email_helper.php';
+require_once __DIR__ . '/system_hours.php';
 
 $query = $_GET;
 $data = [];
@@ -101,6 +102,19 @@ if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
 if (!preg_match('/^\d{2}:\d{2}:\d{2}$/', $time)) {
     http_response_code(400);
     echo json_encode(['status' => 'error', 'msg' => 'time must be HH:MM:SS', 'retryable' => false]);
+    exit;
+}
+
+$hoursState = libraryHoursEvaluate($conn);
+if (!$hoursState['is_open']) {
+    echo json_encode(
+        libraryHoursApiClosedPayload(
+            $conn,
+            'RFID attendance is unavailable while the library is closed.',
+            $hoursState
+        ),
+        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+    );
     exit;
 }
 

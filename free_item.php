@@ -4,6 +4,13 @@ requireLogin();
 requireRole('librarian');
 require_once 'db.php';
 
+enforceOperatingHoursPageGate(
+    $conn,
+    ['librarian'],
+    'Library Access Temporarily Closed',
+    'Reservation release actions are unavailable outside operating hours.'
+);
+
 
 if (!isset($_GET['type'], $_GET['id'], $_GET['csrf'])) {
     http_response_code(400);

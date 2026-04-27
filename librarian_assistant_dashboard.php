@@ -5,6 +5,13 @@ requireLogin();
 requireRole('librarian', 'assistant');
 require_once 'db.php';
 
+enforceOperatingHoursPageGate(
+    $conn,
+    ['librarian', 'assistant'],
+    'Library Access Temporarily Closed',
+    'Librarian and assistant access is unavailable outside operating hours.'
+);
+
 if (!isset($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }

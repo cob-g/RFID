@@ -16,6 +16,8 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
+require_once __DIR__ . '/system_hours.php';
+
 // Roles
 define('ROLE_ADMIN',   'admin');
 define('ROLE_STUDENT', 'student');
@@ -87,4 +89,54 @@ function verifyCsrf(string $token): bool
 {
     return isset($_SESSION['csrf_token']) &&
            hash_equals($_SESSION['csrf_token'], $token);
+}
+
+function roleIsSubjectToOperatingHours(string $role): bool
+{
+    return in_array($role, ['admin', 'librarian', 'assistant', 'faculty', 'student'], true);
+}
+
+function enforceOperatingHoursPageGate(
+    mysqli $conn,
+    array $roles = [],
+    string $title = 'Library Access Temporarily Closed',
+    string $subtitle = 'This section is unavailable outside operating hours.'
+): void {
+    $currentRole = strtolower((string) ($_SESSION['role'] ?? ''));
+    if ($currentRole === '') {
+        return;
+    }
+
+    if ($currentRole === 'superadmin') {
+        return;
+    }
+
+    $normalizedRoles = array_values(array_filter(array_map(
+        static fn(string $role): string => strtolower(trim($role)),
+        $roles
+    ), static fn(string $role): bool => $role !== ''));
+
+    if ($normalizedRoles === []) {
+        if (!roleIsSubjectToOperatingHours($currentRole)) {
+            return;
+        }
+    } elseif (!in_array($currentRole, $normalizedRoles, true)) {
+        return;
+    }
+
+    $hoursState = libraryHoursEvaluate($conn);
+    if ($hoursState['is_open']) {
+        return;
+    }
+
+    libraryHoursRenderClosedPage($conn, $title, $subtitle, 403, $hoursState);
+}
+
+function operatingHoursClosedApiPayload(
+    mysqli $conn,
+    string $prefix = 'Library access is currently closed.',
+    ?array $hoursState = null
+): array {
+    $state = is_array($hoursState) ? $hoursState : libraryHoursEvaluate($conn);
+    return libraryHoursApiClosedPayload($conn, $prefix, $state);
 }

@@ -49,6 +49,19 @@ CREATE TABLE `enrollment_tokens` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 
+CREATE TABLE `system_hours` (
+  `id` tinyint(1) unsigned NOT NULL DEFAULT 1,
+  `open_time` time NOT NULL DEFAULT '08:00:00',
+  `close_time` time NOT NULL DEFAULT '17:00:00',
+  `updated_by` int(11) DEFAULT NULL,
+  `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+
+INSERT INTO `system_hours` (`id`, `open_time`, `close_time`, `updated_by`) VALUES
+(1, '08:00:00', '17:00:00', NULL);
+
+
 CREATE TABLE `computers` (
   `id` int(11) NOT NULL,
   `computer_number` varchar(50) NOT NULL,
@@ -250,6 +263,13 @@ ALTER TABLE `enrollment_tokens`
   ADD UNIQUE KEY `uq_enrollment_token` (`token`),
   ADD UNIQUE KEY `uq_enrollment_user` (`user_id`),
   ADD KEY `idx_enrollment_exp` (`expires_at`);
+
+--
+-- Indexes for table `system_hours`
+--
+ALTER TABLE `system_hours`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_system_hours_updated_by` (`updated_by`);
 
 --
 -- Indexes for table `pending_rfid_assignments`

@@ -6,6 +6,7 @@ session_start();
 require_once __DIR__ . '/auth.php';
 requireLogin();
 requireRole('admin', 'superadmin');
+require_once __DIR__ . '/db.php';
 
 header('Content-Type: application/json; charset=UTF-8');
 
@@ -102,6 +103,26 @@ function rfidProxyRequest(string $url, string $method = 'GET', ?string $body = n
     }
 
     return ['ok' => true, 'status' => $status, 'body' => (string) $respBody, 'error' => ''];
+}
+
+$currentRole = strtolower((string) ($_SESSION['role'] ?? ''));
+if ($currentRole === 'admin') {
+    $hoursState = libraryHoursEvaluate($conn);
+    if (!$hoursState['is_open']) {
+        $closed = operatingHoursClosedApiPayload(
+            $conn,
+            'RFID portal actions are unavailable while the library is closed.',
+            $hoursState
+        );
+
+        rfidProxyRespond(200, [
+            'success' => false,
+            'status' => 'closed',
+            'message' => $closed['msg'],
+            'reopens_at' => $closed['reopens_at'],
+            'hours' => $closed['hours'],
+        ]);
+    }
 }
 
 $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
