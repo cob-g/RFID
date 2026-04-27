@@ -20,12 +20,12 @@ function rfidProxyPortalBaseUrl(): string
 {
     $portalUrl = getenv('RFID_PORTAL_URL');
     if ($portalUrl === false || trim($portalUrl) === '') {
-        $portalUrl = 'http://192.168.0.124/';
+        $portalUrl = 'http://192.168.0.100/';
     }
 
     $portalUrl = rtrim((string) $portalUrl, '/') . '/';
     if (!filter_var($portalUrl, FILTER_VALIDATE_URL)) {
-        return 'http://192.168.0.124/';
+        return 'http://192.168.0.100/';
     }
 
     return $portalUrl;

@@ -645,7 +645,7 @@ if ($isAjaxRequest) {
             $conn->begin_transaction();
 
             $peekStmt = $conn->prepare(
-                'SELECT status, reserved_by FROM seats WHERE id = ? LIMIT 1'
+                'SELECT status, reserved_by, expires_at FROM seats WHERE id = ? LIMIT 1'
             );
             $peekStmt->bind_param('i', $id);
             $peekStmt->execute();
@@ -653,6 +653,19 @@ if ($isAjaxRequest) {
             $peekStmt->close();
 
             $isRelease = ($peekSeat && (int)$peekSeat['reserved_by'] === $user_id);
+            $isConfirmedMine = (
+                $isRelease
+                && (string) ($peekSeat['status'] ?? '') === 'reserved'
+                && empty($peekSeat['expires_at'])
+            );
+
+            if ($isConfirmedMine && isUserTimedInToday($conn, $user_id)) {
+                $conn->rollback();
+                jsonResponse([
+                    'success' => false,
+                    'message' => 'Confirmed allocations can only be released after RFID TIME_OUT.',
+                ]);
+            }
 
             if (!$isRelease) {
                 // Temporarily disabled daily reservation limit for testing.
@@ -837,7 +850,7 @@ if ($isAjaxRequest) {
             $conn->begin_transaction();
 
             $peekStmt = $conn->prepare(
-                'SELECT status, reserved_by FROM computers WHERE id = ? LIMIT 1'
+                'SELECT status, reserved_by, expires_at FROM computers WHERE id = ? LIMIT 1'
             );
             $peekStmt->bind_param('i', $id);
             $peekStmt->execute();
@@ -845,6 +858,19 @@ if ($isAjaxRequest) {
             $peekStmt->close();
 
             $isRelease = ($peekComp && (int)$peekComp['reserved_by'] === $user_id);
+            $isConfirmedMine = (
+                $isRelease
+                && (string) ($peekComp['status'] ?? '') === 'reserved'
+                && empty($peekComp['expires_at'])
+            );
+
+            if ($isConfirmedMine && isUserTimedInToday($conn, $user_id)) {
+                $conn->rollback();
+                jsonResponse([
+                    'success' => false,
+                    'message' => 'Confirmed allocations can only be released after RFID TIME_OUT.',
+                ]);
+            }
 
             if (!$isRelease) {
                 // Temporarily disabled daily reservation limit for testing.
@@ -1065,10 +1091,12 @@ function getComputer(int $id): ?array
 function seatButton(?array $seat, bool $forceDisabled = false): string
 {
     if (!$seat) return '';
-    global $user_id, $csrfToken;
+    global $user_id, $csrfToken, $userTimedInNow;
 
     $isMine = ((int)$seat['reserved_by'] === $user_id);
     $isPending = ($seat['status'] === 'reserved' && !empty($seat['expires_at']));
+    $isConfirmedMine = ($isMine && !$isPending);
+    $isAttendanceLocked = ($isConfirmedMine && $userTimedInNow);
     $cls    = 'seat-button';
 
     if ($isPending) {
@@ -1081,8 +1109,11 @@ function seatButton(?array $seat, bool $forceDisabled = false): string
     if ($forceDisabled) {
         $cls .= ' disabled';
     }
+    if ($isAttendanceLocked) {
+        $cls .= ' attendance-locked';
+    }
 
-    $isDisabled = $forceDisabled || ($seat['status'] !== 'available' && !$isMine);
+    $isDisabled = $forceDisabled || ($seat['status'] !== 'available' && !$isMine) || $isAttendanceLocked;
     $disabled   = $isDisabled ? 'disabled' : '';
     $action     = $isMine ? 'release' : 'reserve';
     $seatId     = (int)$seat['id'];
@@ -1104,10 +1135,12 @@ function seatButton(?array $seat, bool $forceDisabled = false): string
 function computerButton(?array $comp): string
 {
     if (!$comp) return '';
-    global $user_id, $csrfToken;
+    global $user_id, $csrfToken, $userTimedInNow;
 
     $isMine = ((int)$comp['reserved_by'] === $user_id);
     $isPending = ($comp['status'] === 'reserved' && !empty($comp['expires_at']));
+    $isConfirmedMine = ($isMine && !$isPending);
+    $isAttendanceLocked = ($isConfirmedMine && $userTimedInNow);
     $cls    = 'computer-button';
 
     if ($isPending) {
@@ -1117,7 +1150,10 @@ function computerButton(?array $comp): string
     } elseif ($comp['status'] !== 'available') {
         $cls .= ' taken';
     }
-    $isDisabled = ($comp['status'] !== 'available' && !$isMine);
+    if ($isAttendanceLocked) {
+        $cls .= ' attendance-locked';
+    }
+    $isDisabled = ($comp['status'] !== 'available' && !$isMine) || $isAttendanceLocked;
     $disabled   = $isDisabled ? 'disabled' : '';
     $action     = $isMine ? 'release' : 'reserve';
     $compId     = (int)$comp['id'];
@@ -1421,12 +1457,20 @@ body {
     min-width: 0;
 }
 
-.main-content { min-width: 0; display: flex; flex-direction: column; }
+.main-content {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    max-width: 1080px;
+    margin: 0 auto;
+}
 
 .ct-sidebar {
     position: sticky;
-    bottom: 56px; top: auto;
-    align-self: end;
+    top: 26px;
+    bottom: auto;
+    align-self: start;
     max-height: calc(100vh - 120px);
     display: flex;
     flex-direction: column;
@@ -1734,7 +1778,7 @@ body {
     text-align: center;
     box-shadow: var(--shadow);
     backdrop-filter: blur(20px);
-    transform: translateY(-120px);
+    transform: none;
 }
 
 .ct-card-title {
@@ -2411,14 +2455,17 @@ function syncButtons(seatsData, compsData) {
 function applyButtonState(btn, status, reservedBy, expiresAt, type) {
     const isMine  = (parseInt(reservedBy) === MY_USER);
     const isPending = (status === 'reserved' && !!expiresAt);
+    const isConfirmedMine = (isMine && status === 'reserved' && !expiresAt);
+    const releaseLocked = (isConfirmedMine && userTimedIn);
     const isTaken = (status !== 'available' && !isMine && !isPending);
     const forceDisabled = (btn.dataset.forceDisabled === '1');
 
     btn.classList.toggle('reserved-by-you', isMine && !isPending);
     btn.classList.toggle('pending-confirmation', isPending);
+    btn.classList.toggle('attendance-locked', releaseLocked);
     btn.classList.toggle('taken',           isTaken);
 
-    btn.disabled = forceDisabled || (status !== 'available' && !isMine);
+    btn.disabled = forceDisabled || (status !== 'available' && !isMine) || releaseLocked;
     btn.dataset.action = isMine ? 'release' : 'reserve';
 }
 

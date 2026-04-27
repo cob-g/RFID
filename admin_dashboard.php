@@ -11,6 +11,23 @@ if (!isset($_SESSION['csrf_token'])) {
 
 $current_role = $_SESSION['role'];
 
+$allowedInitialTabs = ['dashboard', 'users', 'seats', 'computers', 'rfid-portal'];
+$initialTab = 'dashboard';
+
+$requestedTab = trim((string) ($_GET['tab'] ?? ''));
+if ($requestedTab !== '' && in_array($requestedTab, $allowedInitialTabs, true)) {
+    $initialTab = $requestedTab;
+}
+
+if (!empty($_SESSION['redirect_to_users'])) {
+    $initialTab = 'users';
+    unset($_SESSION['redirect_to_users']);
+}
+
+$pageSuccess = isset($_SESSION['success']) ? (string) $_SESSION['success'] : '';
+$pageError = isset($_SESSION['error']) ? (string) $_SESSION['error'] : '';
+unset($_SESSION['success'], $_SESSION['error']);
+
 $rfidPortalUrl = getenv('RFID_PORTAL_URL');
 if ($rfidPortalUrl === false || trim($rfidPortalUrl) === '') {
     $rfidPortalUrl = 'http://192.168.0.100/';
@@ -18,6 +35,47 @@ if ($rfidPortalUrl === false || trim($rfidPortalUrl) === '') {
 $rfidPortalUrl = rtrim((string) $rfidPortalUrl, '/') . '/';
 if (!filter_var($rfidPortalUrl, FILTER_VALIDATE_URL)) {
     $rfidPortalUrl = 'http://192.168.0.100/';
+}
+
+function adminTableExists(mysqli $conn, string $table): bool
+{
+    static $cache = [];
+    if (array_key_exists($table, $cache)) {
+        return $cache[$table];
+    }
+
+    $stmt = $conn->prepare(
+        'SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1'
+    );
+    $stmt->bind_param('s', $table);
+    $stmt->execute();
+    $stmt->bind_result($one);
+    $exists = $stmt->fetch();
+    $stmt->close();
+
+    $cache[$table] = (bool) $exists;
+    return $cache[$table];
+}
+
+function adminColumnExists(mysqli $conn, string $table, string $column): bool
+{
+    static $cache = [];
+    $key = $table . '.' . $column;
+    if (array_key_exists($key, $cache)) {
+        return $cache[$key];
+    }
+
+    $stmt = $conn->prepare(
+        'SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ? LIMIT 1'
+    );
+    $stmt->bind_param('ss', $table, $column);
+    $stmt->execute();
+    $stmt->bind_result($one);
+    $exists = $stmt->fetch();
+    $stmt->close();
+
+    $cache[$key] = (bool) $exists;
+    return $cache[$key];
 }
 
 $total_users               = mysqli_fetch_assoc(mysqli_query($conn, "SELECT COUNT(*) AS total FROM users"))['total'];
@@ -38,6 +96,74 @@ $computers_query = mysqli_query($conn, "
     FROM computers
     LEFT JOIN users ON computers.reserved_by = users.id
 ");
+
+$rfidUidByUserId = [];
+
+if (
+    adminTableExists($conn, 'rfid_cards')
+    && adminColumnExists($conn, 'rfid_cards', 'user_id')
+    && adminColumnExists($conn, 'rfid_cards', 'uid')
+) {
+    $cardsStatusFilter = adminColumnExists($conn, 'rfid_cards', 'status')
+        ? " WHERE status='active'"
+        : '';
+
+    $cardsResult = mysqli_query(
+        $conn,
+        "SELECT user_id, GROUP_CONCAT(DISTINCT uid ORDER BY uid SEPARATOR ', ') AS uids
+         FROM rfid_cards{$cardsStatusFilter}
+         GROUP BY user_id"
+    );
+
+    if ($cardsResult instanceof mysqli_result) {
+        while ($row = mysqli_fetch_assoc($cardsResult)) {
+            $uidOwner = (int) ($row['user_id'] ?? 0);
+            if ($uidOwner <= 0) {
+                continue;
+            }
+            $uids = array_filter(array_map('trim', explode(',', (string) ($row['uids'] ?? ''))));
+            foreach ($uids as $uid) {
+                if (!isset($rfidUidByUserId[$uidOwner])) {
+                    $rfidUidByUserId[$uidOwner] = [];
+                }
+                $rfidUidByUserId[$uidOwner][$uid] = true;
+            }
+        }
+    }
+}
+
+if (
+    adminTableExists($conn, 'rfid_devices')
+    && adminColumnExists($conn, 'rfid_devices', 'user_id')
+    && adminColumnExists($conn, 'rfid_devices', 'uid')
+) {
+    $devicesStatusFilter = adminColumnExists($conn, 'rfid_devices', 'status')
+        ? " WHERE status='active'"
+        : '';
+
+    $devicesResult = mysqli_query(
+        $conn,
+        "SELECT user_id, GROUP_CONCAT(DISTINCT uid ORDER BY uid SEPARATOR ', ') AS uids
+         FROM rfid_devices{$devicesStatusFilter}
+         GROUP BY user_id"
+    );
+
+    if ($devicesResult instanceof mysqli_result) {
+        while ($row = mysqli_fetch_assoc($devicesResult)) {
+            $uidOwner = (int) ($row['user_id'] ?? 0);
+            if ($uidOwner <= 0) {
+                continue;
+            }
+            $uids = array_filter(array_map('trim', explode(',', (string) ($row['uids'] ?? ''))));
+            foreach ($uids as $uid) {
+                if (!isset($rfidUidByUserId[$uidOwner])) {
+                    $rfidUidByUserId[$uidOwner] = [];
+                }
+                $rfidUidByUserId[$uidOwner][$uid] = true;
+            }
+        }
+    }
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -360,6 +486,26 @@ body {
     letter-spacing: 0.05em;
     text-transform: uppercase;
     margin-top: 6px;
+}
+
+.panel-flash {
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 0.84rem;
+    line-height: 1.5;
+    margin-bottom: 14px;
+}
+
+.panel-flash.ok {
+    background: rgba(34, 197, 94, 0.14);
+    border: 1px solid rgba(34, 197, 94, 0.30);
+    color: #4ade80;
+}
+
+.panel-flash.err {
+    background: rgba(239, 68, 68, 0.14);
+    border: 1px solid rgba(239, 68, 68, 0.30);
+    color: #fca5a5;
 }
 
 /* ── Sections ── */
@@ -726,7 +872,7 @@ tbody tr:last-child td { border-bottom: none; }
     min-height: 780px;
     border: 0;
     display: block;
-    background: #fff;
+    background: rgba(10, 14, 20, 0.72);
 }
 
 /* ═══════════════════════════════════════════
@@ -777,19 +923,19 @@ tbody tr:last-child td { border-bottom: none; }
     <div class="sidebar-nav">
         <div class="nav-section-label">Navigation</div>
 
-        <button class="tab-button active" data-tab="dashboard">
+        <button class="tab-button <?= $initialTab === 'dashboard' ? 'active' : '' ?>" data-tab="dashboard">
             <span class="nav-icon">🏠</span> Dashboard
         </button>
-        <button class="tab-button" data-tab="users">
+        <button class="tab-button <?= $initialTab === 'users' ? 'active' : '' ?>" data-tab="users">
             <span class="nav-icon">👥</span> Manage Users
         </button>
-        <button class="tab-button" data-tab="seats">
+        <button class="tab-button <?= $initialTab === 'seats' ? 'active' : '' ?>" data-tab="seats">
             <span class="nav-icon">🪑</span> Seat Allocation
         </button>
-        <button class="tab-button" data-tab="computers">
+        <button class="tab-button <?= $initialTab === 'computers' ? 'active' : '' ?>" data-tab="computers">
             <span class="nav-icon">🖥️</span> Manage Computers
         </button>
-        <button class="tab-button" data-tab="rfid-portal">
+        <button class="tab-button <?= $initialTab === 'rfid-portal' ? 'active' : '' ?>" data-tab="rfid-portal">
             <span class="nav-icon">📡</span> RFID Portal
         </button>
     </div>
@@ -824,8 +970,15 @@ tbody tr:last-child td { border-bottom: none; }
             </div>
         </div>
 
+        <?php if ($pageSuccess !== ''): ?>
+        <div class="panel-flash ok"><?= htmlspecialchars($pageSuccess) ?></div>
+        <?php endif; ?>
+        <?php if ($pageError !== ''): ?>
+        <div class="panel-flash err"><?= htmlspecialchars($pageError) ?></div>
+        <?php endif; ?>
+
         <!-- ══════ DASHBOARD SECTION ══════ -->
-        <section id="dashboard" class="section active">
+        <section id="dashboard" class="section <?= $initialTab === 'dashboard' ? 'active' : '' ?>">
 
             <div class="cards">
                 <div class="card">
@@ -863,7 +1016,7 @@ tbody tr:last-child td { border-bottom: none; }
         </section>
 
         <!-- ══════ USERS SECTION ══════ -->
-        <section id="users" class="section">
+        <section id="users" class="section <?= $initialTab === 'users' ? 'active' : '' ?>">
             <div class="section-title">Manage Users</div>
 
             <div class="table-wrap">
@@ -874,6 +1027,7 @@ tbody tr:last-child td { border-bottom: none; }
                                 <th>ID</th>
                                 <th>Username</th>
                                 <th>Role</th>
+                                <th>RFID UID</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
@@ -883,6 +1037,13 @@ tbody tr:last-child td { border-bottom: none; }
                             $hasRows = false;
                             while ($user = mysqli_fetch_assoc($result)):
                                 $hasRows = true;
+                                $uidDisplay = '—';
+                                $userRowId = (int) ($user['id'] ?? 0);
+                                if (isset($rfidUidByUserId[$userRowId]) && !empty($rfidUidByUserId[$userRowId])) {
+                                    $uidValues = array_keys($rfidUidByUserId[$userRowId]);
+                                    sort($uidValues, SORT_NATURAL | SORT_FLAG_CASE);
+                                    $uidDisplay = implode(', ', $uidValues);
+                                }
                                 $canEdit = $canDelete = false;
                                 if ($current_role === 'superadmin') {
                                     $canEdit = $canDelete = true;
@@ -897,6 +1058,9 @@ tbody tr:last-child td { border-bottom: none; }
                                     <span class="badge <?= in_array($user['role'],['admin','superadmin']) ? 'reserved' : 'available' ?>">
                                         <?= ucfirst($user['role']) ?>
                                     </span>
+                                </td>
+                                <td style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace; font-size:0.80rem; color:var(--text-sub);">
+                                    <?= htmlspecialchars($uidDisplay) ?>
                                 </td>
                                 <td>
                                     <div class="actions">
@@ -915,7 +1079,7 @@ tbody tr:last-child td { border-bottom: none; }
                             </tr>
                             <?php endwhile; ?>
                             <?php if (!$hasRows): ?>
-                            <tr class="empty-row"><td colspan="4">No users found.</td></tr>
+                            <tr class="empty-row"><td colspan="5">No users found.</td></tr>
                             <?php endif; ?>
                         </tbody>
                     </table>
@@ -924,7 +1088,7 @@ tbody tr:last-child td { border-bottom: none; }
         </section>
 
         <!-- ══════ SEATS SECTION ══════ -->
-        <section id="seats" class="section">
+        <section id="seats" class="section <?= $initialTab === 'seats' ? 'active' : '' ?>">
             <div class="section-title">Seat Allocation</div>
 
             <div class="table-wrap">
@@ -974,7 +1138,7 @@ tbody tr:last-child td { border-bottom: none; }
         </section>
 
         <!-- ══════ COMPUTERS SECTION ══════ -->
-        <section id="computers" class="section">
+        <section id="computers" class="section <?= $initialTab === 'computers' ? 'active' : '' ?>">
             <div class="section-title">Computer Allocation</div>
 
             <div class="table-wrap">
@@ -1032,7 +1196,7 @@ tbody tr:last-child td { border-bottom: none; }
         </section>
 
         <!-- ══════ RFID PORTAL SECTION ══════ -->
-        <section id="rfid-portal" class="section">
+        <section id="rfid-portal" class="section <?= $initialTab === 'rfid-portal' ? 'active' : '' ?>">
             <div class="section-title">RFID Device Portal</div>
 
             <div class="welcome-box" style="margin-bottom:14px;">
@@ -1093,6 +1257,8 @@ buttons.forEach(btn => {
         sections.forEach(s => s.classList.remove('active'));
         btn.classList.add('active');
         document.getElementById(btn.dataset.tab).classList.add('active');
+        const nextUrl = window.location.pathname + '?tab=' + encodeURIComponent(btn.dataset.tab);
+        window.history.replaceState(null, '', nextUrl);
         closeSidebar();
     });
 });
