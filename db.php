@@ -18,6 +18,22 @@ if (!defined('API_KEY')) {
     define('API_KEY', (string) ($envApiKey !== '' ? $envApiKey : 'SCC-2026-SECURE'));
 }
 
+if (!defined('RFID_PORTAL_URL')) {
+    $portalUrl = getenv('RFID_PORTAL_URL');
+    if ($portalUrl === false || trim($portalUrl) === '') {
+        $portalUrl = $_ENV['RFID_PORTAL_URL'] ?? ($_SERVER['RFID_PORTAL_URL'] ?? '');
+    }
+    $portalUrl = trim((string) $portalUrl);
+    if ($portalUrl === '') {
+        $portalUrl = 'http://192.168.1.19/';
+    }
+    if (!filter_var($portalUrl, FILTER_VALIDATE_URL)) {
+        $portalUrl = 'http://192.168.1.19/';
+    }
+    $portalUrl = rtrim($portalUrl, '/') . '/';
+    define('RFID_PORTAL_URL', $portalUrl);
+}
+
 // ── Strict MySQLi error mode ───────────────────────────────────────────────────
 // All MySQLi errors will throw mysqli_sql_exception instead of returning false.
 mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);

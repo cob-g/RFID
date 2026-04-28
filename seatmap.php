@@ -136,6 +136,57 @@ function seatSystemColumnExists(mysqli $conn, string $table, string $column): bo
     return $cache[$key];
 }
 
+function seatSystemUserHasActiveRfidUid(mysqli $conn, int $userId): bool
+{
+    static $cache = [];
+    if (array_key_exists($userId, $cache)) {
+        return $cache[$userId];
+    }
+
+    try {
+        $hasCards = seatSystemColumnExists($conn, 'rfid_cards', 'user_id')
+            && seatSystemColumnExists($conn, 'rfid_cards', 'uid');
+        if ($hasCards) {
+            $where = 'user_id = ?';
+            if (seatSystemColumnExists($conn, 'rfid_cards', 'status')) {
+                $where .= " AND status = 'active'";
+            }
+            $stmt = $conn->prepare('SELECT 1 FROM rfid_cards WHERE ' . $where . ' LIMIT 1');
+            $stmt->bind_param('i', $userId);
+            $stmt->execute();
+            $found = (bool) $stmt->get_result()->fetch_row();
+            $stmt->close();
+            if ($found) {
+                $cache[$userId] = true;
+                return true;
+            }
+        }
+
+        $hasDevices = seatSystemColumnExists($conn, 'rfid_devices', 'user_id')
+            && seatSystemColumnExists($conn, 'rfid_devices', 'uid');
+        if ($hasDevices) {
+            $where = 'user_id = ?';
+            if (seatSystemColumnExists($conn, 'rfid_devices', 'status')) {
+                $where .= " AND status = 'active'";
+            }
+            $stmt = $conn->prepare('SELECT 1 FROM rfid_devices WHERE ' . $where . ' LIMIT 1');
+            $stmt->bind_param('i', $userId);
+            $stmt->execute();
+            $found = (bool) $stmt->get_result()->fetch_row();
+            $stmt->close();
+            if ($found) {
+                $cache[$userId] = true;
+                return true;
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[SeatSystem] RFID UID check failed: ' . $e->getMessage());
+    }
+
+    $cache[$userId] = false;
+    return false;
+}
+
 function seatSystemCleanupExpiredPendingInTable(mysqli $conn, string $table): int
 {
     if (
@@ -555,7 +606,7 @@ if ($isAjaxRequest) {
 $csrfToken = ensureCsrfToken();
 
 $userInfoStmt = $conn->prepare(
-    'SELECT username, email FROM users WHERE id = ? LIMIT 1'
+    'SELECT username, email, status FROM users WHERE id = ? LIMIT 1'
 );
 $userInfoStmt->bind_param('i', $user_id);
 $userInfoStmt->execute();
@@ -564,6 +615,11 @@ $userInfoStmt->close();
 
 $studentEmail = $userInfo['email']    ?? '';
 $studentName  = $userInfo['username'] ?? ($_SESSION['username'] ?? 'Student');
+$userHasRfidUid = seatSystemUserHasActiveRfidUid($conn, $user_id);
+$rfidEnrollmentMessage = 'RFID card not enrolled yet. Please register your card UID in the portal.';
+if (defined('RFID_PORTAL_URL') && RFID_PORTAL_URL !== '') {
+    $rfidEnrollmentMessage .= ' ' . RFID_PORTAL_URL;
+}
 
 function jsonResponse(array $data): never
 {
@@ -697,6 +753,14 @@ if ($isAjaxRequest) {
                 jsonResponse([
                     'success' => false,
                     'message' => 'Confirmed allocations can only be released after RFID TIME_OUT.',
+                ]);
+            }
+
+            if (!$isRelease && !$userHasRfidUid) {
+                $conn->rollback();
+                jsonResponse([
+                    'success' => false,
+                    'message' => $rfidEnrollmentMessage,
                 ]);
             }
 
@@ -901,6 +965,14 @@ if ($isAjaxRequest) {
                 jsonResponse([
                     'success' => false,
                     'message' => 'Confirmed allocations can only be released after RFID TIME_OUT.',
+                ]);
+            }
+
+            if (!$isRelease && !$userHasRfidUid) {
+                $conn->rollback();
+                jsonResponse([
+                    'success' => false,
+                    'message' => $rfidEnrollmentMessage,
                 ]);
             }
 
