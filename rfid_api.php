@@ -146,10 +146,38 @@ $stmt->close();
 if ($isDup) {
     $dupReleased = ['seats' => 0, 'computers' => 0];
     if ($existingAction === 'TIME_OUT' && $card['user_id'] !== null) {
+        $dupSeatLabels = [];
+        $dupComputerLabels = [];
+        $dupUserId = (int) $card['user_id'];
         try {
-            $dupReleased = rfidApiAutoReleaseAllocations($conn, (int) $card['user_id']);
+            $dupSeatLabels = rfidApiCurrentSeatLabelsForUser($conn, $dupUserId);
+        } catch (Throwable $e) {
+            error_log('[rfid_api] Duplicate TIME_OUT seat lookup failed: ' . $e->getMessage());
+        }
+        try {
+            $dupComputerLabels = rfidApiCurrentComputerLabelsForUser($conn, $dupUserId);
+        } catch (Throwable $e) {
+            error_log('[rfid_api] Duplicate TIME_OUT computer lookup failed: ' . $e->getMessage());
+        }
+
+        try {
+            $dupReleased = rfidApiAutoReleaseAllocations($conn, $dupUserId);
         } catch (Throwable $e) {
             error_log('[rfid_api] Duplicate TIME_OUT auto-release failed: ' . $e->getMessage());
+        }
+
+        if (($dupReleased['seats'] + $dupReleased['computers']) > 0) {
+            try {
+                rfidApiSendTimeoutEmailForUser(
+                    $conn,
+                    $dupUserId,
+                    $dupSeatLabels,
+                    $dupComputerLabels,
+                    'TIME_OUT'
+                );
+            } catch (Throwable $e) {
+                error_log('[rfid_api] Duplicate TIME_OUT email failed: ' . $e->getMessage());
+            }
         }
     }
 
@@ -195,10 +223,38 @@ if ($action === 'TIME_OUT') {
     if (rfidApiHasAttendanceActionToday($conn, $uid, $card['user_id'], $date, 'TIME_OUT')) {
         $alreadyReleased = ['seats' => 0, 'computers' => 0];
         if ($card['user_id'] !== null) {
+            $alreadySeatLabels = [];
+            $alreadyComputerLabels = [];
+            $alreadyUserId = (int) $card['user_id'];
             try {
-                $alreadyReleased = rfidApiAutoReleaseAllocations($conn, (int) $card['user_id']);
+                $alreadySeatLabels = rfidApiCurrentSeatLabelsForUser($conn, $alreadyUserId);
+            } catch (Throwable $e) {
+                error_log('[rfid_api] Already-timed-out seat lookup failed: ' . $e->getMessage());
+            }
+            try {
+                $alreadyComputerLabels = rfidApiCurrentComputerLabelsForUser($conn, $alreadyUserId);
+            } catch (Throwable $e) {
+                error_log('[rfid_api] Already-timed-out computer lookup failed: ' . $e->getMessage());
+            }
+
+            try {
+                $alreadyReleased = rfidApiAutoReleaseAllocations($conn, $alreadyUserId);
             } catch (Throwable $e) {
                 error_log('[rfid_api] Already-timed-out auto-release failed: ' . $e->getMessage());
+            }
+
+            if (($alreadyReleased['seats'] + $alreadyReleased['computers']) > 0) {
+                try {
+                    rfidApiSendTimeoutEmailForUser(
+                        $conn,
+                        $alreadyUserId,
+                        $alreadySeatLabels,
+                        $alreadyComputerLabels,
+                        'TIME_OUT'
+                    );
+                } catch (Throwable $e) {
+                    error_log('[rfid_api] Already-timed-out email failed: ' . $e->getMessage());
+                }
             }
         }
 
@@ -255,10 +311,38 @@ if ($action === 'TIME_IN' && $card['user_id'] !== null) {
 
 $released = ['seats' => 0, 'computers' => 0];
 if ($action === 'TIME_OUT' && $card['user_id'] !== null) {
+    $timeoutSeatLabels = [];
+    $timeoutComputerLabels = [];
+    $timeoutUserId = (int) $card['user_id'];
     try {
-        $released = rfidApiAutoReleaseAllocations($conn, (int) $card['user_id']);
+        $timeoutSeatLabels = rfidApiCurrentSeatLabelsForUser($conn, $timeoutUserId);
+    } catch (Throwable $e) {
+        error_log('[rfid_api] Timeout seat lookup failed: ' . $e->getMessage());
+    }
+    try {
+        $timeoutComputerLabels = rfidApiCurrentComputerLabelsForUser($conn, $timeoutUserId);
+    } catch (Throwable $e) {
+        error_log('[rfid_api] Timeout computer lookup failed: ' . $e->getMessage());
+    }
+
+    try {
+        $released = rfidApiAutoReleaseAllocations($conn, $timeoutUserId);
     } catch (Throwable $e) {
         error_log('[rfid_api] Auto-release failed: ' . $e->getMessage());
+    }
+
+    if (($released['seats'] + $released['computers']) > 0) {
+        try {
+            rfidApiSendTimeoutEmailForUser(
+                $conn,
+                $timeoutUserId,
+                $timeoutSeatLabels,
+                $timeoutComputerLabels,
+                'TIME_OUT'
+            );
+        } catch (Throwable $e) {
+            error_log('[rfid_api] Timeout email failed: ' . $e->getMessage());
+        }
     }
 }
 
@@ -560,15 +644,16 @@ function rfidApiReleaseUserItems(mysqli $conn, string $table, int $userId): int
     return $affected;
 }
 
-function rfidApiCleanupExpiredPendingTable(mysqli $conn, string $table): int
+function rfidApiCleanupExpiredPendingTable(mysqli $conn, string $table, string $labelColumn): array
 {
     if (
         !rfidApiTableExists($conn, $table)
         || !rfidApiColumnExists($conn, $table, 'status')
         || !rfidApiColumnExists($conn, $table, 'reserved_by')
         || !rfidApiColumnExists($conn, $table, 'expires_at')
+        || !rfidApiColumnExists($conn, $table, $labelColumn)
     ) {
-        return 0;
+        return ['count' => 0, 'rows' => []];
     }
 
     $setParts = [
@@ -588,20 +673,84 @@ function rfidApiCleanupExpiredPendingTable(mysqli $conn, string $table): int
         $where .= " AND reservation_status='pending'";
     }
 
+    $rows = [];
+    $selectSql = 'SELECT reserved_by, ' . $labelColumn . ' AS label FROM ' . $table . ' WHERE ' . $where . ' FOR UPDATE';
+    $stmt = $conn->prepare($selectSql);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    while ($row = $result->fetch_assoc()) {
+        $userId = (int) ($row['reserved_by'] ?? 0);
+        $label = trim((string) ($row['label'] ?? ''));
+        $rows[] = ['user_id' => $userId, 'label' => $label];
+    }
+    $stmt->close();
+
     $sql = 'UPDATE ' . $table . ' SET ' . implode(', ', $setParts) . ' WHERE ' . $where;
     $stmt = $conn->prepare($sql);
     $stmt->execute();
     $affected = max(0, $stmt->affected_rows);
     $stmt->close();
 
-    return $affected;
+    return ['count' => $affected, 'rows' => $rows];
 }
 
 function rfidApiCleanupExpiredPendingReservations(mysqli $conn): array
 {
+    $seatData = ['count' => 0, 'rows' => []];
+    $compData = ['count' => 0, 'rows' => []];
+
+    try {
+        $conn->begin_transaction();
+        $seatData = rfidApiCleanupExpiredPendingTable($conn, 'seats', 'seat_number');
+        $compData = rfidApiCleanupExpiredPendingTable($conn, 'computers', 'computer_number');
+        $conn->commit();
+    } catch (Throwable $e) {
+        $conn->rollback();
+        error_log('[rfid_api] Expired pending cleanup failed: ' . $e->getMessage());
+        return ['seats' => 0, 'computers' => 0];
+    }
+
+    if (($seatData['count'] + $compData['count']) > 0) {
+        $notify = [];
+        if ($seatData['count'] > 0) {
+            foreach ($seatData['rows'] as $row) {
+                $userId = (int) ($row['user_id'] ?? 0);
+                if ($userId <= 0) {
+                    continue;
+                }
+                $label = trim((string) ($row['label'] ?? ''));
+                $notify[$userId]['seats'][] = $label;
+            }
+        }
+        if ($compData['count'] > 0) {
+            foreach ($compData['rows'] as $row) {
+                $userId = (int) ($row['user_id'] ?? 0);
+                if ($userId <= 0) {
+                    continue;
+                }
+                $label = trim((string) ($row['label'] ?? ''));
+                $notify[$userId]['computers'][] = $label;
+            }
+        }
+
+        foreach ($notify as $userId => $labels) {
+            try {
+                rfidApiSendTimeoutEmailForUser(
+                    $conn,
+                    (int) $userId,
+                    $labels['seats'] ?? [],
+                    $labels['computers'] ?? [],
+                    'pending-expired'
+                );
+            } catch (Throwable $e) {
+                error_log('[rfid_api] Timeout email failed: ' . $e->getMessage());
+            }
+        }
+    }
+
     return [
-        'seats' => rfidApiCleanupExpiredPendingTable($conn, 'seats'),
-        'computers' => rfidApiCleanupExpiredPendingTable($conn, 'computers'),
+        'seats' => (int) $seatData['count'],
+        'computers' => (int) $compData['count'],
     ];
 }
 
@@ -697,6 +846,34 @@ function rfidApiCurrentSeatLabelsForUser(mysqli $conn, int $userId): array
     $labels = [];
     while ($row = $result->fetch_assoc()) {
         $label = trim((string) ($row['seat_number'] ?? ''));
+        if ($label !== '') {
+            $labels[] = $label;
+        }
+    }
+    $stmt->close();
+
+    return $labels;
+}
+
+function rfidApiCurrentComputerLabelsForUser(mysqli $conn, int $userId): array
+{
+    if (
+        !rfidApiTableExists($conn, 'computers')
+        || !rfidApiColumnExists($conn, 'computers', 'reserved_by')
+        || !rfidApiColumnExists($conn, 'computers', 'status')
+        || !rfidApiColumnExists($conn, 'computers', 'computer_number')
+    ) {
+        return [];
+    }
+
+    $stmt = $conn->prepare("SELECT computer_number FROM computers WHERE reserved_by = ? AND status='reserved' ORDER BY id");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    $labels = [];
+    while ($row = $result->fetch_assoc()) {
+        $label = trim((string) ($row['computer_number'] ?? ''));
         if ($label !== '') {
             $labels[] = $label;
         }
@@ -816,6 +993,35 @@ function rfidApiSendSeatConfirmedEmailForUser(
     }
 
     rfidApiSeatConfirmedEmailMarkSent($emailKey);
+}
+
+function rfidApiSendTimeoutEmailForUser(
+    mysqli $conn,
+    int $userId,
+    array $seatLabels,
+    array $computerLabels,
+    string $reason
+): void {
+    if (!function_exists('sendReservationTimeoutEmail')) {
+        return;
+    }
+
+    $contact = rfidApiLookupUserContact($conn, $userId);
+    if ($contact === null) {
+        return;
+    }
+
+    $sent = sendReservationTimeoutEmail(
+        $contact['email'],
+        $contact['name'],
+        $seatLabels,
+        $computerLabels,
+        $reason
+    );
+
+    if (!$sent) {
+        error_log('[rfid_api] Reservation timeout email returned false for user_id=' . $userId);
+    }
 }
 
 function rfidApiAutoReleaseAllocations(mysqli $conn, int $userId): array

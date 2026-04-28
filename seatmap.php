@@ -54,7 +54,13 @@ if (!$hoursState['is_open']) {
         'Library Access Temporarily Closed',
         'Student and faculty access is unavailable outside operating hours.',
         403,
-        $hoursState
+        $hoursState,
+        [
+            'auto_reopen' => true,
+            'poll_url' => 'seatmap.php?poll=1',
+            'redirect_url' => 'seatmap.php',
+            'poll_interval_ms' => 5000,
+        ]
     );
 }
 
@@ -187,14 +193,15 @@ function seatSystemUserHasActiveRfidUid(mysqli $conn, int $userId): bool
     return false;
 }
 
-function seatSystemCleanupExpiredPendingInTable(mysqli $conn, string $table): int
+function seatSystemCleanupExpiredPendingInTable(mysqli $conn, string $table, string $labelColumn): array
 {
     if (
         !seatSystemColumnExists($conn, $table, 'status')
         || !seatSystemColumnExists($conn, $table, 'reserved_by')
         || !seatSystemColumnExists($conn, $table, 'expires_at')
+        || !seatSystemColumnExists($conn, $table, $labelColumn)
     ) {
-        return 0;
+        return ['count' => 0, 'rows' => []];
     }
 
     $setParts = ["status='available'", 'reserved_by=NULL'];
@@ -211,20 +218,84 @@ function seatSystemCleanupExpiredPendingInTable(mysqli $conn, string $table): in
         $where .= " AND reservation_status='pending'";
     }
 
+    $rows = [];
+    $selectSql = 'SELECT reserved_by, ' . $labelColumn . ' AS label FROM ' . $table . ' WHERE ' . $where . ' FOR UPDATE';
+    $stmt = $conn->prepare($selectSql);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    while ($row = $result->fetch_assoc()) {
+        $userId = (int) ($row['reserved_by'] ?? 0);
+        $label = trim((string) ($row['label'] ?? ''));
+        $rows[] = ['user_id' => $userId, 'label' => $label];
+    }
+    $stmt->close();
+
     $sql = 'UPDATE ' . $table . ' SET ' . implode(', ', $setParts) . ' WHERE ' . $where;
     $stmt = $conn->prepare($sql);
     $stmt->execute();
     $affected = max(0, $stmt->affected_rows);
     $stmt->close();
 
-    return $affected;
+    return ['count' => $affected, 'rows' => $rows];
 }
 
 function seatSystemCleanupExpiredPendingAllocations(mysqli $conn): array
 {
+    $seatData = ['count' => 0, 'rows' => []];
+    $compData = ['count' => 0, 'rows' => []];
+
+    try {
+        $conn->begin_transaction();
+        $seatData = seatSystemCleanupExpiredPendingInTable($conn, 'seats', 'seat_number');
+        $compData = seatSystemCleanupExpiredPendingInTable($conn, 'computers', 'computer_number');
+        $conn->commit();
+    } catch (Throwable $e) {
+        $conn->rollback();
+        error_log('[SeatSystem] Expired pending cleanup failed: ' . $e->getMessage());
+        return ['seats' => 0, 'computers' => 0];
+    }
+
+    if (($seatData['count'] + $compData['count']) > 0) {
+        $notify = [];
+        if ($seatData['count'] > 0) {
+            foreach ($seatData['rows'] as $row) {
+                $userId = (int) ($row['user_id'] ?? 0);
+                if ($userId <= 0) {
+                    continue;
+                }
+                $label = trim((string) ($row['label'] ?? ''));
+                $notify[$userId]['seats'][] = $label;
+            }
+        }
+        if ($compData['count'] > 0) {
+            foreach ($compData['rows'] as $row) {
+                $userId = (int) ($row['user_id'] ?? 0);
+                if ($userId <= 0) {
+                    continue;
+                }
+                $label = trim((string) ($row['label'] ?? ''));
+                $notify[$userId]['computers'][] = $label;
+            }
+        }
+
+        foreach ($notify as $userId => $labels) {
+            try {
+                seatSystemSendTimeoutEmailForUser(
+                    $conn,
+                    (int) $userId,
+                    $labels['seats'] ?? [],
+                    $labels['computers'] ?? [],
+                    'pending-expired'
+                );
+            } catch (Throwable $e) {
+                error_log('[SeatSystem] Timeout email failed: ' . $e->getMessage());
+            }
+        }
+    }
+
     return [
-        'seats' => seatSystemCleanupExpiredPendingInTable($conn, 'seats'),
-        'computers' => seatSystemCleanupExpiredPendingInTable($conn, 'computers'),
+        'seats' => (int) $seatData['count'],
+        'computers' => (int) $compData['count'],
     ];
 }
 
@@ -309,6 +380,33 @@ function seatSystemCurrentSeatLabelsForUser(mysqli $conn, int $userId): array
     $labels = [];
     while ($row = $result->fetch_assoc()) {
         $label = trim((string) ($row['seat_number'] ?? ''));
+        if ($label !== '') {
+            $labels[] = $label;
+        }
+    }
+    $stmt->close();
+
+    return $labels;
+}
+
+function seatSystemCurrentComputerLabelsForUser(mysqli $conn, int $userId): array
+{
+    if (
+        !seatSystemColumnExists($conn, 'computers', 'status')
+        || !seatSystemColumnExists($conn, 'computers', 'reserved_by')
+        || !seatSystemColumnExists($conn, 'computers', 'computer_number')
+    ) {
+        return [];
+    }
+
+    $stmt = $conn->prepare("SELECT computer_number FROM computers WHERE reserved_by = ? AND status='reserved' ORDER BY id");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    $labels = [];
+    while ($row = $result->fetch_assoc()) {
+        $label = trim((string) ($row['computer_number'] ?? ''));
         if ($label !== '') {
             $labels[] = $label;
         }
@@ -464,6 +562,35 @@ function seatSystemSendSeatConfirmedEmail(
     seatSystemSeatConfirmedEmailMarkSent($emailKey);
 }
 
+function seatSystemSendTimeoutEmailForUser(
+    mysqli $conn,
+    int $userId,
+    array $seatLabels,
+    array $computerLabels,
+    string $reason
+): void {
+    if (!function_exists('sendReservationTimeoutEmail')) {
+        return;
+    }
+
+    $contact = seatSystemLookupUserContact($conn, $userId);
+    if ($contact === null) {
+        return;
+    }
+
+    $sent = sendReservationTimeoutEmail(
+        $contact['email'],
+        $contact['name'],
+        $seatLabels,
+        $computerLabels,
+        $reason
+    );
+
+    if (!$sent) {
+        error_log('[SeatSystem] Reservation timeout email returned false for user ID ' . $userId);
+    }
+}
+
 function seatSystemReleaseUserAllocationsInTable(mysqli $conn, string $table, int $userId): int
 {
     if (!seatSystemColumnExists($conn, $table, 'reserved_by')) {
@@ -539,12 +666,42 @@ function seatSystemSyncAllocationsByAttendance(mysqli $conn, int $userId): array
     }
 
     if ($latestAction === 'TIME_OUT') {
+        $timeoutSeatLabels = [];
+        $timeoutComputerLabels = [];
+        try {
+            $timeoutSeatLabels = seatSystemCurrentSeatLabelsForUser($conn, $userId);
+        } catch (Throwable $e) {
+            error_log('[SeatSystem] Timeout seat lookup failed: ' . $e->getMessage());
+        }
+        try {
+            $timeoutComputerLabels = seatSystemCurrentComputerLabelsForUser($conn, $userId);
+        } catch (Throwable $e) {
+            error_log('[SeatSystem] Timeout computer lookup failed: ' . $e->getMessage());
+        }
+
+        $releasedSeats = seatSystemReleaseUserAllocationsInTable($conn, 'seats', $userId);
+        $releasedComputers = seatSystemReleaseUserAllocationsInTable($conn, 'computers', $userId);
+
+        if (($releasedSeats + $releasedComputers) > 0) {
+            try {
+                seatSystemSendTimeoutEmailForUser(
+                    $conn,
+                    $userId,
+                    $timeoutSeatLabels,
+                    $timeoutComputerLabels,
+                    'TIME_OUT'
+                );
+            } catch (Throwable $e) {
+                error_log('[SeatSystem] Timeout email failed: ' . $e->getMessage());
+            }
+        }
+
         return [
             'timed_in' => false,
             'confirmed_seats' => 0,
             'confirmed_computers' => 0,
-            'released_seats' => seatSystemReleaseUserAllocationsInTable($conn, 'seats', $userId),
-            'released_computers' => seatSystemReleaseUserAllocationsInTable($conn, 'computers', $userId),
+            'released_seats' => $releasedSeats,
+            'released_computers' => $releasedComputers,
         ];
     }
 
@@ -616,10 +773,7 @@ $userInfoStmt->close();
 $studentEmail = $userInfo['email']    ?? '';
 $studentName  = $userInfo['username'] ?? ($_SESSION['username'] ?? 'Student');
 $userHasRfidUid = seatSystemUserHasActiveRfidUid($conn, $user_id);
-$rfidEnrollmentMessage = 'RFID card not enrolled yet. Please register your card UID in the portal.';
-if (defined('RFID_PORTAL_URL') && RFID_PORTAL_URL !== '') {
-    $rfidEnrollmentMessage .= ' ' . RFID_PORTAL_URL;
-}
+$rfidEnrollmentMessage = 'RFID card not enrolled yet. Please contact the library administrator to register your card UID.';
 
 function jsonResponse(array $data): never
 {

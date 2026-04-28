@@ -148,6 +148,42 @@ function sendSeatConfirmedEmail(
   return _send($toEmail, $studentName, $subject, $html, $text);
 }
 
+  /**
+   * Send a reservation released email after TIME_OUT or pending-expired cleanup.
+   */
+  function sendReservationTimeoutEmail(
+    string $toEmail,
+    string $studentName,
+    array $seatLabels,
+    array $computerLabels,
+    string $reason,
+    string $datetime = ''
+  ): bool {
+    $seatLabels = _normalizeLabelList($seatLabels);
+    $computerLabels = _normalizeLabelList($computerLabels);
+
+    if (empty($seatLabels) && empty($computerLabels)) {
+      return false;
+    }
+
+    $reason = trim($reason);
+    if ($reason === '') {
+      $reason = 'TIME_OUT';
+    }
+
+    date_default_timezone_set('Asia/Manila');
+    if ($datetime === '') {
+      $datetime = date('F j, Y \\a\\t g:i A');
+    }
+
+    $subjectItem = _buildTimeoutSubjectLabels($seatLabels, $computerLabels);
+    $subject = '⌛ Reservation Released – ' . $subjectItem . ' | ' . SCHOOL_NAME;
+    $html = _buildTimeoutHtml($studentName, $seatLabels, $computerLabels, $reason, $datetime);
+    $text = _buildTimeoutPlainText($studentName, $seatLabels, $computerLabels, $reason, $datetime);
+
+    return _send($toEmail, $studentName, $subject, $html, $text);
+  }
+
 function queueSeatEmail(string $toEmail, string $studentName, string $seatNumber, string $location = 'Study Area') {
     global $conn;
     $stmt = $conn->prepare("INSERT INTO email_queue (to_email, subject, body, status) VALUES (?, ?, ?, 'pending')");
@@ -385,6 +421,134 @@ function _buildPlainText(array $d): string
          . "• Support: {$d['support_email']}\n\n"
          . "Library Services Team\n{$d['school_name']}\n{$d['school_address']}\n\n"
          . "──\nThis is an automated message. Please do not reply directly.";
+}
+
+function _normalizeLabelList(array $labels): array
+{
+    $labels = array_values(array_unique(array_filter(array_map(
+        static fn($v): string => trim((string) $v),
+        $labels
+    ), static fn(string $v): bool => $v !== '')));
+
+    sort($labels, SORT_NATURAL | SORT_FLAG_CASE);
+    return $labels;
+}
+
+function _buildTimeoutSubjectLabels(array $seatLabels, array $computerLabels): string
+{
+    $parts = [];
+    if (!empty($seatLabels)) {
+        $seatList = implode(', ', $seatLabels);
+        $parts[] = count($seatLabels) === 1 ? ('Seat ' . $seatLabels[0]) : ('Seats ' . $seatList);
+    }
+    if (!empty($computerLabels)) {
+        $compList = implode(', ', $computerLabels);
+        $parts[] = count($computerLabels) === 1
+            ? ('Computer ' . $computerLabels[0])
+            : ('Computers ' . $compList);
+    }
+    if (empty($parts)) {
+        return 'Reservation';
+    }
+
+    return implode(' + ', $parts);
+}
+
+function _buildTimeoutHtml(
+    string $studentName,
+    array $seatLabels,
+    array $computerLabels,
+    string $reason,
+    string $datetime
+): string {
+    $safeName = htmlspecialchars($studentName, ENT_QUOTES, 'UTF-8');
+    $safeReason = htmlspecialchars($reason, ENT_QUOTES, 'UTF-8');
+    $safeDatetime = htmlspecialchars($datetime, ENT_QUOTES, 'UTF-8');
+    $seatList = empty($seatLabels)
+        ? 'None'
+        : htmlspecialchars(implode(', ', $seatLabels), ENT_QUOTES, 'UTF-8');
+    $computerList = empty($computerLabels)
+        ? 'None'
+        : htmlspecialchars(implode(', ', $computerLabels), ENT_QUOTES, 'UTF-8');
+    $support = htmlspecialchars(SUPPORT_EMAIL, ENT_QUOTES, 'UTF-8');
+    $school = htmlspecialchars(SCHOOL_NAME, ENT_QUOTES, 'UTF-8');
+    $system = htmlspecialchars(SYSTEM_NAME, ENT_QUOTES, 'UTF-8');
+    $address = htmlspecialchars(SCHOOL_ADDRESS, ENT_QUOTES, 'UTF-8');
+    $website = htmlspecialchars(SCHOOL_WEBSITE, ENT_QUOTES, 'UTF-8');
+
+    $accentColor = '#b45309';
+    $detailRows = '';
+    $detailRows .= _detailRow('Seats', $seatList, $accentColor);
+    $detailRows .= _detailRow('Computers', $computerList, $accentColor);
+    $detailRows .= _detailRow('Released At', $safeDatetime, '#111827');
+    $detailRows .= _detailRow('Reason', $safeReason, $accentColor);
+
+    return <<<HTML
+    <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Reservation Released</title></head>
+    <body style="margin:0;padding:0;background:#fff7ed;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;">
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#fff7ed;min-height:100vh;">
+      <tr><td align="center" style="padding:36px 16px;">
+        <table width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,0.08);">
+          <tr>
+            <td style="background:linear-gradient(135deg,#f59e0b 0%,#b45309 100%);padding:30px 34px 24px;text-align:center;">
+              <div style="font-size:40px;line-height:1;margin-bottom:10px;">⌛</div>
+              <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:700;">Reservation Released</h1>
+              <p style="margin:8px 0 0;color:rgba(255,255,255,0.9);font-size:13px;">{$system}</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:28px 34px 18px;">
+              <p style="margin:0 0 14px;font-size:15px;color:#111827;line-height:1.6;">Hi <strong>{$safeName}</strong>,</p>
+              <p style="margin:0 0 18px;font-size:14.5px;color:#1f2937;line-height:1.7;">
+                Your reservation has been released.</p>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#fffbeb;border:1px solid #fde68a;border-radius:12px;overflow:hidden;">
+                <tr><td style="padding:16px 18px;">{$detailRows}</td></tr>
+              </table>
+              <p style="margin:18px 0 0;font-size:13.5px;color:#4b5563;line-height:1.7;">
+                If this was unexpected, please contact support at <a href="mailto:{$support}" style="color:#b45309;text-decoration:none;">{$support}</a>.</p>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:20px 0 0;">
+                <tr><td align="center">
+                  <a href="{$website}" style="display:inline-block;background:#b45309;color:#ffffff;text-decoration:none;padding:12px 28px;border-radius:10px;font-size:14px;font-weight:700;">Open Allocation System</a>
+                </td></tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="background:#fef3c7;border-top:1px solid #fde68a;padding:18px 30px;text-align:center;">
+              <p style="margin:0 0 4px;font-size:11.5px;color:#92400e;">Library Services Team</p>
+              <p style="margin:0;font-size:11.5px;color:#92400e;">{$school}<br>{$address}</p>
+            </td>
+          </tr>
+        </table>
+      </td></tr>
+    </table>
+    </body></html>
+    HTML;
+}
+
+function _buildTimeoutPlainText(
+    string $studentName,
+    array $seatLabels,
+    array $computerLabels,
+    string $reason,
+    string $datetime
+): string {
+    $seatList = empty($seatLabels) ? 'None' : implode(', ', $seatLabels);
+    $computerList = empty($computerLabels) ? 'None' : implode(', ', $computerLabels);
+
+    return "⌛ RESERVATION RELEASED — " . SCHOOL_NAME . "\n\n"
+        . "Hi {$studentName},\n\n"
+        . "Your reservation has been released.\n\n"
+        . "DETAILS\n-------\n"
+        . "Seats      : {$seatList}\n"
+        . "Computers  : {$computerList}\n"
+        . "Released At: {$datetime}\n"
+        . "Reason     : {$reason}\n\n"
+        . "If this was unexpected, contact support at " . SUPPORT_EMAIL . ".\n\n"
+        . "Library Services Team\n" . SCHOOL_NAME . "\n" . SCHOOL_ADDRESS . "\n\n"
+        . "--\nThis is an automated message. Please do not reply directly.";
 }
 
 function _buildSeatConfirmedHtml(

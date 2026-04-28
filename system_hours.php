@@ -377,7 +377,8 @@ function libraryHoursRenderClosedPage(
     string $title = 'Library Access Temporarily Closed',
     string $subtitle = 'This section is unavailable outside operating hours.',
     int $statusCode = 403,
-    ?array $state = null
+    ?array $state = null,
+    ?array $options = null
 ): never {
     $evaluated = is_array($state) ? $state : libraryHoursEvaluate($conn);
     $notice = libraryHoursBuildNotice($evaluated);
@@ -389,6 +390,20 @@ function libraryHoursRenderClosedPage(
     $reasonEsc = htmlspecialchars((string) $notice['reason_line'], ENT_QUOTES, 'UTF-8');
     $hoursEsc = htmlspecialchars((string) $notice['hours_line'], ENT_QUOTES, 'UTF-8');
     $reopenEsc = htmlspecialchars((string) $notice['reopen_line'], ENT_QUOTES, 'UTF-8');
+
+    $options = is_array($options) ? $options : [];
+    $autoReopen = (bool) ($options['auto_reopen'] ?? false);
+    $pollUrl = (string) ($options['poll_url'] ?? '');
+    $redirectUrl = (string) ($options['redirect_url'] ?? '');
+    $pollIntervalMs = (int) ($options['poll_interval_ms'] ?? 3000);
+    if ($pollIntervalMs <= 0) {
+        $pollIntervalMs = 3000;
+    }
+
+    $shouldAutoReopen = $autoReopen
+        && $pollUrl !== ''
+        && $redirectUrl !== ''
+        && ((string) ($evaluated['reason'] ?? '')) !== 'sunday';
 
     echo '<!DOCTYPE html>';
     echo '<html lang="en">';
@@ -423,6 +438,23 @@ function libraryHoursRenderClosedPage(
     echo '<div class="meta"><strong>Next Opening:</strong> ' . $reopenEsc . '</div>';
     echo '<div class="footer">Only superadmin can update opening and closing times. Sunday remains permanently closed.</div>';
     echo '</main>';
+    if ($shouldAutoReopen) {
+        $pollUrlJson = json_encode($pollUrl, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        $redirectUrlJson = json_encode($redirectUrl, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        echo '<script>';
+        echo '(function(){';
+        echo 'const pollUrl=' . $pollUrlJson . ';';
+        echo 'const redirectUrl=' . $redirectUrlJson . ';';
+        echo 'const intervalMs=' . $pollIntervalMs . ';';
+        echo 'setInterval(function(){';
+        echo 'fetch(pollUrl,{cache:"no-store"}).then(function(res){return res.ok?res.json():null;}).then(function(data){';
+        echo 'if(!data) return;';
+        echo 'if(!("closed" in data) || data.closed === false){ window.location.href = redirectUrl; }';
+        echo '}).catch(function(){});';
+        echo '}, intervalMs);';
+        echo '})();';
+        echo '</script>';
+    }
     echo '</body>';
     echo '</html>';
     exit;
