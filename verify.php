@@ -35,10 +35,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['resend'])) {
         $stmt = $conn->prepare("
             SELECT id, username, status
             FROM users
-            WHERE email = ?
+            WHERE LOWER(TRIM(email)) = ?
             LIMIT 1
         ");
-        $stmt->bind_param('s', $email);
+        $emailNorm = strtolower(trim($email));
+        $stmt->bind_param('s', $emailNorm);
         $stmt->execute();
         $user = $stmt->get_result()->fetch_assoc();
         $stmt->close();
@@ -101,10 +102,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['resend'])) {
         $stmt = $conn->prepare("
             SELECT id, username, status, verification_code
             FROM   users
-            WHERE  email = ?
+            WHERE  LOWER(TRIM(email)) = ?
             LIMIT  1
         ");
-        $stmt->bind_param('s', $email);
+        $emailNorm = strtolower(trim($email));
+        $stmt->bind_param('s', $emailNorm);
         $stmt->execute();
         $user = $stmt->get_result()->fetch_assoc();
         $stmt->close();

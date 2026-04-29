@@ -25,7 +25,7 @@ define('SCHOOL_NAME',    'St. Clare College of Caloocan');
 define('SCHOOL_ADDRESS', '164 A. Mabini St., Caloocan City, Metro Manila');
 define('SUPPORT_EMAIL',  'library@stclare.edu.ph');
 define('SCHOOL_WEBSITE', 'https://www.stclare.edu.ph');
-define('VERIFY_URL',     'https:/scc-library.free.nf');
+define('VERIFY_URL',     'https://scc-library.free.nf/verify.php');
 
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -234,6 +234,65 @@ function sendRegistrationEmail(string $toEmail, string $username, string $code):
     }
 }
 
+function generateVerificationCode(): string
+{
+    return str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+}
+
+function findUserByEmail(mysqli $conn, string $email): ?array
+{
+    $normalizedEmail = strtolower(trim($email));
+
+    // First pass: exact match after normalization.
+    $stmt = $conn->prepare("\n        SELECT id, username, status, email\n        FROM users\n        WHERE LOWER(TRIM(email)) = ?\n        LIMIT 1\n    ");
+    $stmt->bind_param('s', $normalizedEmail);
+    $stmt->execute();
+    $user = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    return $user ?: null;
+}
+
+function usernameExists(mysqli $conn, string $username): bool
+{
+    $stmt = $conn->prepare("\n        SELECT id\n        FROM users\n        WHERE username = ?\n        LIMIT 1\n    ");
+    $stmt->bind_param('s', $username);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    return (bool) $row;
+}
+
+function resendVerificationForExistingUser(mysqli $conn, array $user, string $email): void
+{
+    $userId = (int) ($user['id'] ?? 0);
+    $username = (string) ($user['username'] ?? 'Student');
+
+    if ($userId <= 0) {
+        error_log('[register.php] resendVerificationForExistingUser called with invalid user id');
+        return;
+    }
+
+    $newCode = generateVerificationCode();
+
+    $upd = $conn->prepare("\n        UPDATE users\n        SET verification_code = ?, status = 'pending'\n        WHERE id = ?\n    ");
+    $upd->bind_param('si', $newCode, $userId);
+    $upd->execute();
+    $upd->close();
+
+    $sent = sendRegistrationEmail($email, $username, $newCode);
+    if (!$sent) {
+        error_log("[register.php] Resend verification email failed for: {$email}");
+    } else {
+        error_log("[register.php] Resent verification code -> user_id={$userId} email={$email}");
+    }
+
+    session_write_close();
+    header('Location: verify.php?email=' . urlencode($email) . '&resent=1');
+    exit;
+}
+
 
 // ════════════════════════════════════════════════════════════════════════════
 //  PAGE LOGIC
@@ -242,41 +301,74 @@ $message = '';
 
 if (isset($_POST['register'])) {
 
-    $username = trim($_POST['username']);
-    $email    = trim($_POST['email']);
-    $password = trim($_POST['password']);
-    $role     = $_POST['role'];
+    $username = trim($_POST['username'] ?? '');
+    $email    = strtolower(trim($_POST['email'] ?? ''));
+    $password = trim($_POST['password'] ?? '');
+    $role     = (string) ($_POST['role'] ?? '');
 
     if ($username === '' || $email === '' || $password === '') {
         $message = 'All fields are required.';
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $message = 'Please enter a valid email address.';
     } else {
-        $hashed            = password_hash($password, PASSWORD_DEFAULT);
-        $verification_code = (string) rand(100000, 999999);
-        $status            = 'pending';
 
-        try {
-            $stmt = $conn->prepare("
-                INSERT INTO users (username, email, password, role, verification_code, status)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ");
-            $stmt->bind_param('ssssss', $username, $email, $hashed, $role, $verification_code, $status);
-            $stmt->execute();
-            $stmt->close();
-
-            $emailSent = sendRegistrationEmail($email, $username, $verification_code);
-            if (!$emailSent) {
-                error_log("[register.php] Verification email failed for: {$email}");
-            }
-
-            header('Location: verify.php?email=' . urlencode($email));
-            exit();
-
-        } catch (mysqli_sql_exception $e) {
-            if ($e->getCode() == 1062) {
-                $message = 'Username or email already exists.';
+        // ── Pre-insert lookup to avoid confusing 1062 false positives ───────
+        $existingEmailUser = findUserByEmail($conn, $email);
+        if ($existingEmailUser) {
+            $existingStatus = (string) ($existingEmailUser['status'] ?? '');
+            if ($existingStatus === 'active') {
+                $message = 'Email already registered. Please sign in.';
             } else {
-                $message = 'A database error occurred. Please try again.';
-                error_log("[register.php] DB error: " . $e->getMessage());
+                resendVerificationForExistingUser($conn, $existingEmailUser, $email);
+            }
+        } elseif (usernameExists($conn, $username)) {
+            $message = 'Username already taken.';
+        } else {
+
+            $hashed            = password_hash($password, PASSWORD_DEFAULT);
+            $verification_code = generateVerificationCode();
+            $status            = 'pending';
+
+            try {
+                $stmt = $conn->prepare("\n                    INSERT INTO users (username, email, password, role, verification_code, status)\n                    VALUES (?, ?, ?, ?, ?, ?)\n                ");
+                $stmt->bind_param('ssssss', $username, $email, $hashed, $role, $verification_code, $status);
+                $stmt->execute();
+                $stmt->close();
+
+                $emailSent = sendRegistrationEmail($email, $username, $verification_code);
+                if (!$emailSent) {
+                    error_log("[register.php] Verification email failed for: {$email}");
+                }
+
+                session_write_close();
+                header('Location: verify.php?email=' . urlencode($email));
+                exit();
+
+            } catch (mysqli_sql_exception $e) {
+                if ((int) $e->getCode() === 1062) {
+
+                    // Race-condition fallback: log which unique key failed.
+                    error_log('[register.php] Duplicate key on INSERT: ' . $e->getMessage());
+
+                    $existingEmailUser = findUserByEmail($conn, $email);
+                    if ($existingEmailUser) {
+                        $existingStatus = (string) ($existingEmailUser['status'] ?? '');
+                        if ($existingStatus === 'active') {
+                            $message = 'Email already registered. Please sign in.';
+                        } else {
+                            resendVerificationForExistingUser($conn, $existingEmailUser, $email);
+                        }
+                    } elseif (usernameExists($conn, $username)) {
+                        $message = 'Username already taken.';
+                    } else {
+                        $message = 'A system error occurred while creating your account. Please try again.';
+                        error_log('[register.php] 1062 but no matching user found after recheck (possible index/schema issue).');
+                    }
+
+                } else {
+                    $message = 'A database error occurred. Please try again.';
+                    error_log("[register.php] DB error: " . $e->getMessage());
+                }
             }
         }
     }

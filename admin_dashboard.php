@@ -1273,6 +1273,7 @@ tbody tr:last-child td { border-bottom: none; }
                             <tr>
                                 <th>ID</th>
                                 <th>Username</th>
+                                <th>Email</th>
                                 <th>Role</th>
                                 <th>RFID UID</th>
                                 <th>Actions</th>
@@ -1301,6 +1302,9 @@ tbody tr:last-child td { border-bottom: none; }
                             <tr>
                                 <td style="color:var(--text-muted); font-size:0.80rem;">#<?= $user['id'] ?></td>
                                 <td style="font-weight:600; color:var(--text-main);"><?= htmlspecialchars($user['username']) ?></td>
+                                <td style="color:var(--text-sub); font-size:0.85rem; max-width: 260px; overflow-wrap:anywhere;">
+                                    <?= htmlspecialchars($user['email'] ?? '') ?>
+                                </td>
                                 <td>
                                     <span class="badge <?= in_array($user['role'],['admin','superadmin']) ? 'reserved' : 'available' ?>">
                                         <?= ucfirst($user['role']) ?>
@@ -1326,7 +1330,7 @@ tbody tr:last-child td { border-bottom: none; }
                             </tr>
                             <?php endwhile; ?>
                             <?php if (!$hasRows): ?>
-                            <tr class="empty-row"><td colspan="5">No users found.</td></tr>
+                            <tr class="empty-row"><td colspan="6">No users found.</td></tr>
                             <?php endif; ?>
                         </tbody>
                     </table>
