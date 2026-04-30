@@ -953,7 +953,7 @@ function rfidApiSendSeatConfirmedEmailForUser(
     string $timeInAt = ''
 ): void
 {
-    if (!function_exists('sendSeatConfirmedEmail')) {
+    if (!function_exists('emailQueueEnqueueSeatConfirmedEmail')) {
         return;
     }
 
@@ -980,18 +980,25 @@ function rfidApiSendSeatConfirmedEmailForUser(
         return;
     }
 
-    $sent = sendSeatConfirmedEmail(
-        $contact['email'],
-        $contact['name'],
-        $seatLabels,
-        'Study Area - Library'
-    );
-
-    if (!$sent) {
-        error_log('[rfid_api] Seat confirmed email returned false for user_id=' . $userId);
+    try {
+        $queuedId = emailQueueEnqueueSeatConfirmedEmail(
+            $conn,
+            $contact['email'],
+            $contact['name'],
+            $seatLabels,
+            'Study Area - Library'
+        );
+    } catch (Throwable $e) {
+        error_log('[rfid_api] Seat confirmed email enqueue failed for user_id=' . $userId . ': ' . $e->getMessage());
         return;
     }
 
+    if ($queuedId <= 0) {
+        error_log('[rfid_api] Seat confirmed email not queued for user_id=' . $userId);
+        return;
+    }
+
+    // IMPORTANT: mark immediately after enqueue to prevent seatmap.php from racing and sending duplicates.
     rfidApiSeatConfirmedEmailMarkSent($emailKey);
 }
 
@@ -1002,7 +1009,7 @@ function rfidApiSendTimeoutEmailForUser(
     array $computerLabels,
     string $reason
 ): void {
-    if (!function_exists('sendReservationTimeoutEmail')) {
+    if (!function_exists('emailQueueEnqueueReservationTimeoutEmail')) {
         return;
     }
 
@@ -1011,16 +1018,22 @@ function rfidApiSendTimeoutEmailForUser(
         return;
     }
 
-    $sent = sendReservationTimeoutEmail(
-        $contact['email'],
-        $contact['name'],
-        $seatLabels,
-        $computerLabels,
-        $reason
-    );
+    try {
+        $queuedId = emailQueueEnqueueReservationTimeoutEmail(
+            $conn,
+            $contact['email'],
+            $contact['name'],
+            $seatLabels,
+            $computerLabels,
+            $reason
+        );
+    } catch (Throwable $e) {
+        error_log('[rfid_api] Reservation timeout email enqueue failed for user_id=' . $userId . ': ' . $e->getMessage());
+        return;
+    }
 
-    if (!$sent) {
-        error_log('[rfid_api] Reservation timeout email returned false for user_id=' . $userId);
+    if ($queuedId <= 0) {
+        error_log('[rfid_api] Reservation timeout email not queued for user_id=' . $userId);
     }
 }
 

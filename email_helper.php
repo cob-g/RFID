@@ -639,3 +639,143 @@ function _buildSeatConfirmedPlainText(
         . "Library Services Team\n" . SCHOOL_NAME . "\n" . SCHOOL_ADDRESS . "\n\n"
         . "--\nThis is an automated message. Please do not reply directly.";
 }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    //  EMAIL QUEUE (ASYNC) HELPERS
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Ensure the email queue table exists.
+     *
+     * Note: Uses a single CREATE TABLE IF NOT EXISTS statement (fast, safe).
+     */
+    function emailQueueEnsureTable(mysqli $conn): void
+    {
+      static $ensured = false;
+      if ($ensured) {
+        return;
+      }
+
+      $conn->query(
+        "CREATE TABLE IF NOT EXISTS email_queue (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+          type VARCHAR(64) NOT NULL,
+          to_email VARCHAR(255) NOT NULL,
+          to_name VARCHAR(255) NOT NULL DEFAULT '',
+          payload_json LONGTEXT NOT NULL,
+          status ENUM('pending','processing','sent','failed') NOT NULL DEFAULT 'pending',
+          attempts INT UNSIGNED NOT NULL DEFAULT 0,
+          available_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          last_error TEXT NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          sent_at DATETIME NULL,
+          PRIMARY KEY (id),
+          KEY idx_email_queue_status_available (status, available_at),
+          KEY idx_email_queue_type (type),
+          KEY idx_email_queue_to_email (to_email)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
+      );
+
+      $ensured = true;
+    }
+
+    /**
+     * Enqueue an email job for async sending (does NOT send SMTP here).
+     *
+     * @return int Inserted queue job ID (0 if not queued).
+     */
+    function emailQueueEnqueue(mysqli $conn, string $type, string $toEmail, string $toName, array $payload): int
+    {
+      emailQueueEnsureTable($conn);
+
+      $type = trim($type);
+      if ($type === '') {
+        throw new InvalidArgumentException('Email queue type is required.');
+      }
+
+      $toEmail = trim($toEmail);
+      if ($toEmail === '') {
+        throw new InvalidArgumentException('Recipient email is required.');
+      }
+
+      $toName = trim($toName);
+      if ($toName === '') {
+        $toName = 'Student';
+      }
+
+      $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+      if ($json === false) {
+        throw new RuntimeException('Failed to encode email payload JSON.');
+      }
+
+      $stmt = $conn->prepare(
+        "INSERT INTO email_queue (type, to_email, to_name, payload_json, status, attempts, available_at)
+         VALUES (?, ?, ?, ?, 'pending', 0, NOW())"
+      );
+      $stmt->bind_param('ssss', $type, $toEmail, $toName, $json);
+      $stmt->execute();
+      $stmt->close();
+
+      return (int) $conn->insert_id;
+    }
+
+    /**
+     * Queue a reservation-confirmed email (RFID TIME_IN).
+     */
+    function emailQueueEnqueueSeatConfirmedEmail(
+      mysqli $conn,
+      string $toEmail,
+      string $toName,
+      array $seatLabels,
+      string $location = 'Study Area - Library',
+      string $datetime = ''
+    ): int {
+      $seatLabels = array_values(array_unique(array_filter(array_map(
+        static fn($v): string => trim((string) $v),
+        $seatLabels
+      ), static fn(string $v): bool => $v !== '')));
+      sort($seatLabels, SORT_NATURAL | SORT_FLAG_CASE);
+
+      if (empty($seatLabels)) {
+        return 0;
+      }
+
+      return emailQueueEnqueue($conn, 'seat_confirmed', $toEmail, $toName, [
+        'seat_labels' => $seatLabels,
+        'location' => $location,
+        'datetime' => $datetime,
+      ]);
+    }
+
+    /**
+     * Queue a reservation released/timeout email (RFID TIME_OUT and pending-expired cleanup).
+     */
+    function emailQueueEnqueueReservationTimeoutEmail(
+      mysqli $conn,
+      string $toEmail,
+      string $toName,
+      array $seatLabels,
+      array $computerLabels,
+      string $reason,
+      string $datetime = ''
+    ): int {
+      $seatLabels = _normalizeLabelList($seatLabels);
+      $computerLabels = _normalizeLabelList($computerLabels);
+
+      if (empty($seatLabels) && empty($computerLabels)) {
+        return 0;
+      }
+
+      $reason = trim($reason);
+      if ($reason === '') {
+        $reason = 'TIME_OUT';
+      }
+
+      return emailQueueEnqueue($conn, 'reservation_timeout', $toEmail, $toName, [
+        'seat_labels' => $seatLabels,
+        'computer_labels' => $computerLabels,
+        'reason' => $reason,
+        'datetime' => $datetime,
+      ]);
+    }
