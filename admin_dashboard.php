@@ -98,11 +98,11 @@ unset($_SESSION['success'], $_SESSION['error']);
 
 $rfidPortalUrl = getenv('RFID_PORTAL_URL');
 if ($rfidPortalUrl === false || trim($rfidPortalUrl) === '') {
-    $rfidPortalUrl = 'http://192.168.0.100/';
+    $rfidPortalUrl = 'http://10.147.237.184/';
 }
 $rfidPortalUrl = rtrim((string) $rfidPortalUrl, '/') . '/';
 if (!filter_var($rfidPortalUrl, FILTER_VALIDATE_URL)) {
-    $rfidPortalUrl = 'http://192.168.0.100/';
+    $rfidPortalUrl = 'http://10.147.237.184/';
 }
 
 function adminTableExists(mysqli $conn, string $table): bool

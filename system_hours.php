@@ -64,7 +64,10 @@ function libraryHoursCrossesMidnight(array $config): bool
 function libraryHoursIsOperationalWeekday(DateTimeInterface $date): bool
 {
     // Monday(1) to Saturday(6) are open days; Sunday(0) is closed by policy.
-    return ((int) $date->format('w')) !== 0;
+    // return ((int) $date->format('w')) !== 0;
+
+    // For testing purposes, you can uncomment the following line to make Sunday an operational day.
+    return true;
 }
 
 function libraryHoursFindNextOpenAt(DateTimeImmutable $nowAtTz, array $config, DateTimeZone $tz): DateTimeImmutable
