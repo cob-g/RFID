@@ -44,7 +44,7 @@ if (isset($_POST['login'])) {
                         exit;
                     case "assistant":
                     case "librarian":
-                        header("Location: librarian_assistant_dashboard.php");
+                        header("Location: admin_dashboard.php");
                         exit;
                     case "faculty":
                     case "student":

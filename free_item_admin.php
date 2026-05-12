@@ -1,13 +1,13 @@
 <?php
 require_once 'auth.php';
 requireLogin();
-requireRole('admin', 'superadmin');
+requireRole('admin', 'superadmin', 'librarian', 'assistant');
 require_once 'db.php';
 
 enforceOperatingHoursPageGate(
     $conn,
-    ['admin'],
-    'Admin Access Temporarily Closed',
+    ['admin', 'librarian', 'assistant'],
+    'Staff Access Temporarily Closed',
     'Reservation release actions are available only during operating hours.'
 );
 

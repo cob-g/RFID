@@ -5,7 +5,7 @@ session_start();
 
 require_once __DIR__ . '/auth.php';
 requireLogin();
-requireRole('admin', 'superadmin');
+requireRole('admin', 'superadmin', 'librarian', 'assistant');
 require_once __DIR__ . '/db.php';
 
 header('Content-Type: application/json; charset=UTF-8');
@@ -106,7 +106,7 @@ function rfidProxyRequest(string $url, string $method = 'GET', ?string $body = n
 }
 
 $currentRole = strtolower((string) ($_SESSION['role'] ?? ''));
-if ($currentRole === 'admin') {
+if (in_array($currentRole, ['admin', 'librarian', 'assistant'], true)) {
     $hoursState = libraryHoursEvaluate($conn);
     if (!$hoursState['is_open']) {
         $closed = operatingHoursClosedApiPayload(

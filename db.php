@@ -197,3 +197,40 @@ function authLogWrite(mysqli $conn, array $payload): void
         error_log('[auth_log] Insert failed: ' . $e->getMessage());
     }
 }
+
+function authLogHeartbeatIfNeeded(mysqli $conn, int $intervalSeconds = 60): void
+{
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        return;
+    }
+    if (empty($_SESSION['user_id'])) {
+        return;
+    }
+
+    $lastBeat = $_SESSION['auth_log_last_heartbeat'] ?? 0;
+    if (!is_int($lastBeat)) {
+        $lastBeat = is_numeric($lastBeat) ? (int) $lastBeat : 0;
+    }
+
+    $now = time();
+    if (($now - $lastBeat) < $intervalSeconds) {
+        return;
+    }
+
+    $_SESSION['auth_log_last_heartbeat'] = $now;
+
+    authLogWrite($conn, [
+        'user_id' => (int) $_SESSION['user_id'],
+        'username' => (string) ($_SESSION['username'] ?? ''),
+        'role' => (string) ($_SESSION['role'] ?? ''),
+        'identity' => (string) ($_SESSION['username'] ?? ''),
+        'action' => 'heartbeat',
+        'session_id' => session_id(),
+        'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
+        'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? '',
+    ]);
+}
+
+if ($conn instanceof mysqli) {
+    authLogHeartbeatIfNeeded($conn);
+}

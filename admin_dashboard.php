@@ -2,7 +2,7 @@
 session_start();
 include 'auth.php';
 requireLogin();
-requireRole('admin', 'superadmin');
+requireRole('admin', 'superadmin', 'librarian', 'assistant');
 include 'db.php';
 
 if (!isset($_SESSION['csrf_token'])) {
@@ -12,6 +12,12 @@ if (!isset($_SESSION['csrf_token'])) {
 $current_role = strtolower((string) ($_SESSION['role'] ?? ''));
 $isSuperadmin = ($current_role === 'superadmin');
 $currentUserId = (int) ($_SESSION['user_id'] ?? 0);
+$isOpsRole = in_array($current_role, ['librarian', 'assistant'], true);
+$canManageUsers = in_array($current_role, ['admin', 'superadmin'], true);
+$canViewLogs = in_array($current_role, ['admin', 'superadmin'], true);
+if (!defined('AUTH_SESSION_INACTIVE_SECONDS')) {
+    define('AUTH_SESSION_INACTIVE_SECONDS', 300);
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_system_hours'])) {
     if (!$isSuperadmin) {
@@ -52,11 +58,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_system_hours']))
 }
 
 $hoursState = libraryHoursEvaluate($conn);
-if ($current_role === 'admin' && !$hoursState['is_open']) {
+if (in_array($current_role, ['admin', 'librarian', 'assistant'], true) && !$hoursState['is_open']) {
     libraryHoursRenderClosedPage(
         $conn,
-        'Admin Access Temporarily Closed',
-        'Admin actions are available only during operating hours.',
+        'Staff Access Temporarily Closed',
+        'Staff actions are available only during operating hours.',
         403,
         $hoursState
     );
@@ -75,31 +81,48 @@ if ($hoursNextOpenDisplay === '') {
     $hoursNextOpenDisplay = 'Reopening time unavailable';
 }
 
-$allowedInitialTabs = ['dashboard', 'users', 'seats', 'computers', 'rfid-portal', 'logs'];
+$allowedInitialTabs = $isOpsRole
+    ? ['dashboard', 'seats', 'computers', 'rfid-portal']
+    : ['dashboard', 'users', 'seats', 'computers', 'rfid-portal', 'logs'];
 if ($isSuperadmin) {
     $allowedInitialTabs[] = 'system-hours';
 }
 $initialTab = 'dashboard';
 
 $requestedTab = trim((string) ($_GET['tab'] ?? ''));
-if ($requestedTab !== '' && in_array($requestedTab, $allowedInitialTabs, true)) {
-    $initialTab = $requestedTab;
+$accessDenied = false;
+if ($requestedTab !== '') {
+    if (in_array($requestedTab, $allowedInitialTabs, true)) {
+        $initialTab = $requestedTab;
+    } else {
+        $accessDenied = true;
+    }
 }
 
 if (!empty($_SESSION['redirect_to_users'])) {
-    $initialTab = 'users';
+    if ($canManageUsers) {
+        $initialTab = 'users';
+    }
     unset($_SESSION['redirect_to_users']);
 }
 
 $printMode = trim((string) ($_GET['print'] ?? ''));
 $isPrintLogs = ($printMode === 'logs');
 if ($isPrintLogs) {
-    $initialTab = 'logs';
+    if ($canViewLogs) {
+        $initialTab = 'logs';
+    } else {
+        $isPrintLogs = false;
+        $accessDenied = true;
+    }
 }
 
 $pageSuccess = isset($_SESSION['success']) ? (string) $_SESSION['success'] : '';
 $pageError = isset($_SESSION['error']) ? (string) $_SESSION['error'] : '';
 unset($_SESSION['success'], $_SESSION['error']);
+if ($accessDenied && $pageError === '') {
+    $pageError = 'You do not have permission to access that section.';
+}
 
 $reportGeneratedAt = date('M j, Y g:i A');
 $reportPreparedBy = trim((string) ($_SESSION['username'] ?? ''));
@@ -440,7 +463,8 @@ function adminExportAuthEvents(mysqli $conn): void
         });
     }
 
-    $sql = 'SELECT username, role, identity, action, session_id, ip_address, user_agent, created_at FROM auth_log ORDER BY id DESC';
+    $sql = "SELECT username, role, identity, action, session_id, ip_address, user_agent, created_at"
+        . " FROM auth_log WHERE action <> 'heartbeat' ORDER BY id DESC";
     $stmt = $conn->prepare($sql);
     $stmt->execute();
     $result = $stmt->get_result();
@@ -468,20 +492,30 @@ function adminExportAuthSessions(mysqli $conn): void
         });
     }
 
+    $lastActivitySql = "SELECT MAX(l2.created_at) FROM auth_log l2"
+        . " WHERE l2.session_id = l.session_id AND l2.action IN ('login_success', 'logout', 'heartbeat')";
     $sql = "SELECT l.username, l.role, l.identity, l.session_id, l.ip_address, l.user_agent, l.created_at AS login_at,"
-        . " (SELECT l2.created_at FROM auth_log l2 WHERE l2.action = 'logout' AND l2.id > l.id AND l2.session_id = l.session_id ORDER BY l2.id ASC LIMIT 1) AS logout_at"
+        . " (SELECT l2.created_at FROM auth_log l2 WHERE l2.action = 'logout' AND l2.id > l.id AND l2.session_id = l.session_id ORDER BY l2.id ASC LIMIT 1) AS logout_at,"
+        . " ({$lastActivitySql}) AS last_activity_at"
         . " FROM auth_log l WHERE l.action = 'login_success' ORDER BY l.id DESC";
     $stmt = $conn->prepare($sql);
     $stmt->execute();
     $result = $stmt->get_result();
 
-    adminSendCsv('auth_sessions.csv', ['Login', 'Logout', 'Duration', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function ($output) use ($result) {
+    $inactiveCutoff = time() - AUTH_SESSION_INACTIVE_SECONDS;
+    adminSendCsv('auth_sessions.csv', ['Login', 'Logout', 'Duration', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function ($output) use ($result, $inactiveCutoff) {
         while ($row = $result->fetch_assoc()) {
             $startStamp = strtotime((string) ($row['login_at'] ?? ''));
             $endStamp = strtotime((string) ($row['logout_at'] ?? ''));
+            $lastActivityStamp = strtotime((string) ($row['last_activity_at'] ?? ''));
+            if ($lastActivityStamp === false) {
+                $lastActivityStamp = $startStamp;
+            }
             $durationLabel = 'Active';
             if ($startStamp !== false && $endStamp !== false && $endStamp >= $startStamp) {
                 $durationLabel = adminFormatDuration((int) ($endStamp - $startStamp));
+            } elseif ($lastActivityStamp !== false && $lastActivityStamp <= $inactiveCutoff) {
+                $durationLabel = 'Inactive';
             }
 
             fputcsv($output, [
@@ -500,6 +534,10 @@ function adminExportAuthSessions(mysqli $conn): void
 }
 
 if (isset($_GET['export'])) {
+    if (!$canViewLogs) {
+        http_response_code(403);
+        exit('Access denied.');
+    }
     $export = trim((string) $_GET['export']);
     if ($export === 'attendance-events') {
         adminExportAttendanceEvents($conn);
@@ -692,7 +730,7 @@ $authEventsStart = 0;
 $authEventsEnd = 0;
 
 if ($authLogAvailable) {
-    $countResult = mysqli_query($conn, 'SELECT COUNT(*) AS total FROM auth_log');
+    $countResult = mysqli_query($conn, "SELECT COUNT(*) AS total FROM auth_log WHERE action <> 'heartbeat'");
     $authEventsTotal = (int) mysqli_fetch_assoc($countResult)['total'];
     if ($isPrintLogs) {
         $authEventsPage = 1;
@@ -705,8 +743,8 @@ if ($authLogAvailable) {
             = adminPaginationState($authEventsTotal, $authEventsPerPage, $authEventsPage);
     }
 
-    $sql = 'SELECT id, user_id, username, role, identity, action, session_id, ip_address, user_agent, created_at '
-        . 'FROM auth_log ORDER BY id DESC';
+    $sql = "SELECT id, user_id, username, role, identity, action, session_id, ip_address, user_agent, created_at"
+        . " FROM auth_log WHERE action <> 'heartbeat' ORDER BY id DESC";
     if (!$isPrintLogs) {
         $sql .= ' LIMIT ? OFFSET ?';
     }
@@ -743,8 +781,11 @@ if ($authLogAvailable) {
     }
 
     $matchCondition = 'l2.session_id = l.session_id';
+    $lastActivitySql = "SELECT MAX(l2.created_at) FROM auth_log l2"
+        . " WHERE l2.session_id = l.session_id AND l2.action IN ('login_success', 'logout', 'heartbeat')";
     $sql = "SELECT l.id AS login_id, l.user_id, l.username, l.role, l.identity, l.session_id, l.ip_address, l.user_agent, l.created_at AS login_at,"
-        . " (SELECT l2.created_at FROM auth_log l2 WHERE l2.action = 'logout' AND l2.id > l.id AND {$matchCondition} ORDER BY l2.id ASC LIMIT 1) AS logout_at"
+        . " (SELECT l2.created_at FROM auth_log l2 WHERE l2.action = 'logout' AND l2.id > l.id AND {$matchCondition} ORDER BY l2.id ASC LIMIT 1) AS logout_at,"
+        . " ({$lastActivitySql}) AS last_activity_at"
         . " FROM auth_log l WHERE l.action = 'login_success' ORDER BY l.id DESC";
     if (!$isPrintLogs) {
         $sql .= ' LIMIT ? OFFSET ?';
@@ -757,11 +798,19 @@ if ($authLogAvailable) {
     $authSessions = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
 
+    $inactiveCutoff = time() - AUTH_SESSION_INACTIVE_SECONDS;
     foreach ($authSessions as &$row) {
         $startStamp = strtotime((string) ($row['login_at'] ?? ''));
         $endStamp = strtotime((string) ($row['logout_at'] ?? ''));
+        $lastActivityStamp = strtotime((string) ($row['last_activity_at'] ?? ''));
+        if ($lastActivityStamp === false) {
+            $lastActivityStamp = $startStamp;
+        }
+
         if ($startStamp !== false && $endStamp !== false && $endStamp >= $startStamp) {
             $row['duration_label'] = adminFormatDuration((int) ($endStamp - $startStamp));
+        } elseif ($lastActivityStamp !== false && $lastActivityStamp <= $inactiveCutoff) {
+            $row['duration_label'] = 'Inactive';
         } else {
             $row['duration_label'] = 'Active';
         }
@@ -2070,9 +2119,11 @@ tbody tr:last-child td { border-bottom: none; }
         <button class="tab-button <?= $initialTab === 'dashboard' ? 'active' : '' ?>" data-tab="dashboard">
             <span class="nav-icon">🏠</span> Dashboard
         </button>
+        <?php if ($canManageUsers): ?>
         <button class="tab-button <?= $initialTab === 'users' ? 'active' : '' ?>" data-tab="users">
             <span class="nav-icon">👥</span> Manage Users
         </button>
+        <?php endif; ?>
         <button class="tab-button <?= $initialTab === 'seats' ? 'active' : '' ?>" data-tab="seats">
             <span class="nav-icon">🪑</span> Seat Allocation
         </button>
@@ -2082,9 +2133,11 @@ tbody tr:last-child td { border-bottom: none; }
         <button class="tab-button <?= $initialTab === 'rfid-portal' ? 'active' : '' ?>" data-tab="rfid-portal">
             <span class="nav-icon">📡</span> RFID Portal
         </button>
+        <?php if ($canViewLogs): ?>
         <button class="tab-button <?= $initialTab === 'logs' ? 'active' : '' ?>" data-tab="logs">
             <span class="nav-icon">📋</span> Logs
         </button>
+        <?php endif; ?>
         <?php if ($isSuperadmin): ?>
         <button class="tab-button <?= $initialTab === 'system-hours' ? 'active' : '' ?>" data-tab="system-hours">
             <span class="nav-icon">⏰</span> System Hours
@@ -2167,6 +2220,7 @@ tbody tr:last-child td { border-bottom: none; }
             </div>
         </section>
 
+        <?php if ($canManageUsers): ?>
         <!-- ══════ USERS SECTION ══════ -->
         <section id="users" class="section <?= $initialTab === 'users' ? 'active' : '' ?>">
             <div class="section-title">Manage Users</div>
@@ -2242,6 +2296,7 @@ tbody tr:last-child td { border-bottom: none; }
                 </div>
             </div>
         </section>
+        <?php endif; ?>
 
         <!-- ══════ SEATS SECTION ══════ -->
         <section id="seats" class="section <?= $initialTab === 'seats' ? 'active' : '' ?>">
@@ -2404,6 +2459,7 @@ tbody tr:last-child td { border-bottom: none; }
             </div>
         </section>
 
+        <?php if ($canViewLogs): ?>
         <!-- ══════ LOGS SECTION ══════ -->
         <section id="logs" class="section <?= $initialTab === 'logs' ? 'active' : '' ?>">
             <div class="section-title">Login &amp; Attendance Logs</div>
@@ -2616,10 +2672,13 @@ tbody tr:last-child td { border-bottom: none; }
                                         <td><?= htmlspecialchars(adminFormatDateTime($row['time_in_date'] ?? '', $row['time_in_time'] ?? '')) ?></td>
                                         <td><?= htmlspecialchars($timeOutDisplay) ?></td>
                                         <td>
-                                            <?php if (($row['duration_label'] ?? '') === 'Active'): ?>
+                                            <?php $durationLabel = (string) ($row['duration_label'] ?? ''); ?>
+                                            <?php if ($durationLabel === 'Active'): ?>
                                                 <span class="badge info">Active</span>
+                                            <?php elseif ($durationLabel === 'Inactive'): ?>
+                                                <span class="badge warn">Inactive</span>
                                             <?php else: ?>
-                                                <?= htmlspecialchars((string) ($row['duration_label'] ?? '—')) ?>
+                                                <?= htmlspecialchars($durationLabel !== '' ? $durationLabel : '—') ?>
                                             <?php endif; ?>
                                         </td>
                                         <td>
@@ -2866,6 +2925,7 @@ tbody tr:last-child td { border-bottom: none; }
                 <?php endif; ?>
             </div>
         </section>
+        <?php endif; ?>
 
         <?php if ($isSuperadmin): ?>
         <section id="system-hours" class="section <?= $initialTab === 'system-hours' ? 'active' : '' ?>">
