@@ -47,7 +47,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_system_hours']))
         error_log('[admin_dashboard/system_hours] ' . $e->getMessage());
         $_SESSION['error'] = 'Unable to update system hours right now. Please try again.';
     }
-
     header('Location: admin_dashboard.php?tab=system-hours');
     exit;
 }
@@ -98,11 +97,11 @@ unset($_SESSION['success'], $_SESSION['error']);
 
 $rfidPortalUrl = getenv('RFID_PORTAL_URL');
 if ($rfidPortalUrl === false || trim($rfidPortalUrl) === '') {
-    $rfidPortalUrl = 'http://172.20.10.3/';
+    $rfidPortalUrl = 'http://10.147.237.184/';
 }
 $rfidPortalUrl = rtrim((string) $rfidPortalUrl, '/') . '/';
 if (!filter_var($rfidPortalUrl, FILTER_VALIDATE_URL)) {
-    $rfidPortalUrl = 'http://172.20.10.3/';
+    $rfidPortalUrl = 'http://10.147.237.184/';
 }
 
 function adminTableExists(mysqli $conn, string $table): bool
@@ -1715,9 +1714,14 @@ tbody tr:last-child td { border-bottom: none; }
 }
 
 @media print {
+    @page {
+        size: A4 landscape;
+        margin: 12mm;
+    }
     body {
         background: #fff;
         color: #111;
+        font-size: 10pt;
     }
     .bg-layer,
     .bg-overlay,
@@ -1726,6 +1730,9 @@ tbody tr:last-child td { border-bottom: none; }
     .drawer-overlay,
     .no-print {
         display: none !important;
+    }
+    .wrapper {
+        display: block;
     }
     .main-content {
         padding: 0;
@@ -1736,15 +1743,70 @@ tbody tr:last-child td { border-bottom: none; }
     #logs {
         display: block !important;
     }
+    .page-header {
+        margin-bottom: 12px;
+    }
+    .page-header-text h1 {
+        font-size: 16pt;
+    }
+    .header-badge {
+        font-size: 9pt;
+    }
+    .section-title {
+        font-size: 14pt;
+    }
+    .section-subtitle {
+        font-size: 11pt;
+        margin: 10px 0 6px;
+    }
+    .welcome-box {
+        background: none;
+        border: 1px solid #ddd;
+        color: #333;
+        padding: 8px 10px;
+        margin-bottom: 10px;
+    }
+    .table-scroll {
+        overflow: visible;
+    }
     .table-wrap {
         box-shadow: none;
         border: 1px solid #ccc;
+        margin-bottom: 12px;
+        overflow: visible;
+    }
+    table {
+        width: 100%;
+        min-width: 0;
+        table-layout: fixed;
     }
     th {
         color: #111;
+        padding: 6px 8px;
+        font-size: 9pt;
     }
     td {
         color: #222;
+        padding: 6px 8px;
+        font-size: 9pt;
+        word-break: break-word;
+    }
+    tbody tr {
+        page-break-inside: avoid;
+    }
+    .badge {
+        background: none;
+        color: #111;
+        border: 1px solid #555;
+    }
+    .badge::before {
+        display: none;
+    }
+    .cell-sub {
+        color: #444;
+    }
+    .table-pagination {
+        display: none !important;
     }
 }
 </style>
