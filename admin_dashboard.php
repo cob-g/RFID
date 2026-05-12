@@ -76,7 +76,7 @@ if ($hoursNextOpenDisplay === '') {
     $hoursNextOpenDisplay = 'Reopening time unavailable';
 }
 
-$allowedInitialTabs = ['dashboard', 'users', 'seats', 'computers', 'rfid-portal'];
+$allowedInitialTabs = ['dashboard', 'users', 'seats', 'computers', 'rfid-portal', 'logs'];
 if ($isSuperadmin) {
     $allowedInitialTabs[] = 'system-hours';
 }
@@ -146,6 +146,359 @@ function adminColumnExists(mysqli $conn, string $table, string $column): bool
     return $cache[$key];
 }
 
+function adminClampPage($value): int
+{
+    $page = (int) $value;
+    return $page > 0 ? $page : 1;
+}
+
+function adminPaginationState(int $total, int $perPage, int $page): array
+{
+    $totalPages = max(1, (int) ceil($total / $perPage));
+    $page = max(1, min($page, $totalPages));
+    $offset = ($page - 1) * $perPage;
+    $start = $total === 0 ? 0 : ($offset + 1);
+    $end = $total === 0 ? 0 : min($offset + $perPage, $total);
+
+    return [$page, $totalPages, $offset, $start, $end];
+}
+
+function adminPaginationTokens(int $totalPages, int $currentPage): array
+{
+    if ($totalPages <= 7) {
+        return range(1, $totalPages);
+    }
+
+    $tokens = [1];
+    $start = max(2, $currentPage - 1);
+    $end = min($totalPages - 1, $currentPage + 1);
+
+    if ($start > 2) {
+        $tokens[] = 'ellipsis-left';
+    }
+
+    for ($page = $start; $page <= $end; $page += 1) {
+        $tokens[] = $page;
+    }
+
+    if ($end < $totalPages - 1) {
+        $tokens[] = 'ellipsis-right';
+    }
+
+    $tokens[] = $totalPages;
+    return $tokens;
+}
+
+function adminBuildQuery(array $overrides): string
+{
+    $params = $_GET;
+    foreach ($overrides as $key => $value) {
+        if ($value === null || $value === '') {
+            unset($params[$key]);
+        } else {
+            $params[$key] = $value;
+        }
+    }
+
+    return http_build_query($params);
+}
+
+function adminFormatDateTime(?string $date, ?string $time): string
+{
+    $date = trim((string) $date);
+    $time = trim((string) $time);
+    if ($date === '' || $time === '') {
+        return '—';
+    }
+
+    $stamp = strtotime($date . ' ' . $time);
+    if ($stamp === false) {
+        return '—';
+    }
+
+    return date('M j, Y H:i', $stamp);
+}
+
+function adminFormatTimestamp(?string $timestamp): string
+{
+    $timestamp = trim((string) $timestamp);
+    if ($timestamp === '') {
+        return '—';
+    }
+
+    $stamp = strtotime($timestamp);
+    if ($stamp === false) {
+        return '—';
+    }
+
+    return date('M j, Y H:i', $stamp);
+}
+
+function adminFormatDuration(int $seconds): string
+{
+    if ($seconds <= 0) {
+        return '0m';
+    }
+
+    $hours = (int) floor($seconds / 3600);
+    $minutes = (int) floor(($seconds % 3600) / 60);
+    if ($hours <= 0) {
+        return $minutes . 'm';
+    }
+
+    return sprintf('%dh %02dm', $hours, $minutes);
+}
+
+function adminTruncate(string $value, int $limit = 60): string
+{
+    $value = trim($value);
+    if ($value === '' || strlen($value) <= $limit) {
+        return $value;
+    }
+
+    return substr($value, 0, max(0, $limit - 1)) . '…';
+}
+
+function adminSendCsv(string $filename, array $headers, callable $writer): void
+{
+    header('Content-Type: text/csv; charset=UTF-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('Pragma: no-cache');
+    header('Expires: 0');
+
+    $output = fopen('php://output', 'w');
+    fputcsv($output, $headers);
+    $writer($output);
+    fclose($output);
+    exit;
+}
+
+function adminExportAttendanceEvents(mysqli $conn): void
+{
+    if (!adminTableExists($conn, 'attendance')) {
+        adminSendCsv('attendance_events.csv', ['Date Time', 'Action', 'User', 'Role', 'UID', 'Device'], static function () {
+        });
+    }
+
+    $hasUserId = adminColumnExists($conn, 'attendance', 'user_id');
+    $hasDevice = adminColumnExists($conn, 'attendance', 'device');
+    $columns = ['a.name', 'a.uid', 'a.date', 'a.time', 'a.action'];
+    if ($hasDevice) {
+        $columns[] = 'a.device';
+    }
+    if ($hasUserId) {
+        $columns[] = 'a.user_id';
+        $columns[] = 'u.username';
+        $columns[] = 'u.role';
+    }
+
+    $sql = 'SELECT ' . implode(', ', $columns) . ' FROM attendance a';
+    if ($hasUserId) {
+        $sql .= ' LEFT JOIN users u ON u.id = a.user_id';
+    }
+    $sql .= ' ORDER BY a.id DESC';
+
+    $stmt = $conn->prepare($sql);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    adminSendCsv('attendance_events.csv', ['Date Time', 'Action', 'User', 'Role', 'UID', 'Device'], static function ($output) use ($result, $hasDevice) {
+        while ($row = $result->fetch_assoc()) {
+            $userLabel = '—';
+            $rowUserId = (int) ($row['user_id'] ?? 0);
+            if (!empty($row['username'])) {
+                $userLabel = (string) $row['username'];
+            } elseif (!empty($row['name'])) {
+                $userLabel = (string) $row['name'];
+            } elseif ($rowUserId > 0) {
+                $userLabel = 'User #' . $rowUserId;
+            }
+            $roleLabel = $row['role'] !== null && $row['role'] !== '' ? ucfirst((string) $row['role']) : '';
+            $deviceLabel = $hasDevice ? (string) ($row['device'] ?? '') : '';
+
+            fputcsv($output, [
+                adminFormatDateTime($row['date'] ?? '', $row['time'] ?? ''),
+                (string) ($row['action'] ?? ''),
+                $userLabel,
+                $roleLabel,
+                (string) ($row['uid'] ?? ''),
+                $deviceLabel,
+            ]);
+        }
+    });
+}
+
+function adminExportAttendanceSessions(mysqli $conn): void
+{
+    if (!adminTableExists($conn, 'attendance')) {
+        adminSendCsv('attendance_sessions.csv', ['Time In', 'Time Out', 'Duration', 'User', 'Role', 'UID', 'Device'], static function () {
+        });
+    }
+
+    $hasUserId = adminColumnExists($conn, 'attendance', 'user_id');
+    $hasDevice = adminColumnExists($conn, 'attendance', 'device');
+
+    $matchCondition = $hasUserId
+        ? "((a.user_id IS NOT NULL AND a2.user_id = a.user_id) OR (a.user_id IS NULL AND a2.uid = a.uid))"
+        : 'a2.uid = a.uid';
+
+    $timeOutDateSql = "SELECT a2.date FROM attendance a2 WHERE a2.action = 'TIME_OUT' AND a2.id > a.id AND {$matchCondition} ORDER BY a2.id ASC LIMIT 1";
+    $timeOutTimeSql = "SELECT a2.time FROM attendance a2 WHERE a2.action = 'TIME_OUT' AND a2.id > a.id AND {$matchCondition} ORDER BY a2.id ASC LIMIT 1";
+    $timeOutDeviceSql = $hasDevice
+        ? "SELECT a2.device FROM attendance a2 WHERE a2.action = 'TIME_OUT' AND a2.id > a.id AND {$matchCondition} ORDER BY a2.id ASC LIMIT 1"
+        : '';
+
+    $columns = [
+        'a.user_id',
+        'a.name',
+        'a.uid',
+        'a.date AS time_in_date',
+        'a.time AS time_in_time',
+        $hasDevice ? 'a.device AS time_in_device' : null,
+        "({$timeOutDateSql}) AS time_out_date",
+        "({$timeOutTimeSql}) AS time_out_time",
+        $hasDevice ? "({$timeOutDeviceSql}) AS time_out_device" : null,
+    ];
+
+    if ($hasUserId) {
+        $columns[] = 'u.username';
+        $columns[] = 'u.role';
+    }
+
+    $columns = array_values(array_filter($columns));
+    $sql = 'SELECT ' . implode(', ', $columns) . ' FROM attendance a';
+    if ($hasUserId) {
+        $sql .= ' LEFT JOIN users u ON u.id = a.user_id';
+    }
+    $sql .= " WHERE a.action = 'TIME_IN' ORDER BY a.id DESC";
+
+    $stmt = $conn->prepare($sql);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    adminSendCsv('attendance_sessions.csv', ['Time In', 'Time Out', 'Duration', 'User', 'Role', 'UID', 'Device'], static function ($output) use ($result) {
+        while ($row = $result->fetch_assoc()) {
+            $userLabel = '—';
+            $rowUserId = (int) ($row['user_id'] ?? 0);
+            if (!empty($row['username'])) {
+                $userLabel = (string) $row['username'];
+            } elseif (!empty($row['name'])) {
+                $userLabel = (string) $row['name'];
+            } elseif ($rowUserId > 0) {
+                $userLabel = 'User #' . $rowUserId;
+            }
+            $roleLabel = $row['role'] !== null && $row['role'] !== '' ? ucfirst((string) $row['role']) : '';
+
+            $startStamp = strtotime(($row['time_in_date'] ?? '') . ' ' . ($row['time_in_time'] ?? ''));
+            $endStamp = strtotime(($row['time_out_date'] ?? '') . ' ' . ($row['time_out_time'] ?? ''));
+            $durationLabel = 'Active';
+            if ($startStamp !== false && $endStamp !== false && $endStamp >= $startStamp) {
+                $durationLabel = adminFormatDuration((int) ($endStamp - $startStamp));
+            }
+
+            $deviceLabel = '—';
+            $inDevice = (string) ($row['time_in_device'] ?? '');
+            $outDevice = (string) ($row['time_out_device'] ?? '');
+            if ($inDevice !== '' || $outDevice !== '') {
+                if ($inDevice !== '' && $outDevice !== '' && $outDevice !== $inDevice) {
+                    $deviceLabel = $inDevice . ' / ' . $outDevice;
+                } else {
+                    $deviceLabel = $inDevice !== '' ? $inDevice : $outDevice;
+                }
+            }
+
+            fputcsv($output, [
+                adminFormatDateTime($row['time_in_date'] ?? '', $row['time_in_time'] ?? ''),
+                adminFormatDateTime($row['time_out_date'] ?? '', $row['time_out_time'] ?? ''),
+                $durationLabel,
+                $userLabel,
+                $roleLabel,
+                (string) ($row['uid'] ?? ''),
+                $deviceLabel === '—' ? '' : $deviceLabel,
+            ]);
+        }
+    });
+}
+
+function adminExportAuthEvents(mysqli $conn): void
+{
+    if (!adminTableExists($conn, 'auth_log')) {
+        adminSendCsv('auth_events.csv', ['Date Time', 'Action', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function () {
+        });
+    }
+
+    $sql = 'SELECT username, role, identity, action, session_id, ip_address, user_agent, created_at FROM auth_log ORDER BY id DESC';
+    $stmt = $conn->prepare($sql);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    adminSendCsv('auth_events.csv', ['Date Time', 'Action', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function ($output) use ($result) {
+        while ($row = $result->fetch_assoc()) {
+            fputcsv($output, [
+                adminFormatTimestamp($row['created_at'] ?? ''),
+                (string) ($row['action'] ?? ''),
+                (string) ($row['username'] ?? ''),
+                (string) ($row['identity'] ?? ''),
+                (string) ($row['role'] ?? ''),
+                (string) ($row['ip_address'] ?? ''),
+                (string) ($row['session_id'] ?? ''),
+                (string) ($row['user_agent'] ?? ''),
+            ]);
+        }
+    });
+}
+
+function adminExportAuthSessions(mysqli $conn): void
+{
+    if (!adminTableExists($conn, 'auth_log')) {
+        adminSendCsv('auth_sessions.csv', ['Login', 'Logout', 'Duration', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function () {
+        });
+    }
+
+    $sql = "SELECT l.username, l.role, l.identity, l.session_id, l.ip_address, l.user_agent, l.created_at AS login_at,"
+        . " (SELECT l2.created_at FROM auth_log l2 WHERE l2.action = 'logout' AND l2.id > l.id AND l2.session_id = l.session_id ORDER BY l2.id ASC LIMIT 1) AS logout_at"
+        . " FROM auth_log l WHERE l.action = 'login_success' ORDER BY l.id DESC";
+    $stmt = $conn->prepare($sql);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    adminSendCsv('auth_sessions.csv', ['Login', 'Logout', 'Duration', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function ($output) use ($result) {
+        while ($row = $result->fetch_assoc()) {
+            $startStamp = strtotime((string) ($row['login_at'] ?? ''));
+            $endStamp = strtotime((string) ($row['logout_at'] ?? ''));
+            $durationLabel = 'Active';
+            if ($startStamp !== false && $endStamp !== false && $endStamp >= $startStamp) {
+                $durationLabel = adminFormatDuration((int) ($endStamp - $startStamp));
+            }
+
+            fputcsv($output, [
+                adminFormatTimestamp($row['login_at'] ?? ''),
+                adminFormatTimestamp($row['logout_at'] ?? ''),
+                $durationLabel,
+                (string) ($row['username'] ?? ''),
+                (string) ($row['identity'] ?? ''),
+                (string) ($row['role'] ?? ''),
+                (string) ($row['ip_address'] ?? ''),
+                (string) ($row['session_id'] ?? ''),
+                (string) ($row['user_agent'] ?? ''),
+            ]);
+        }
+    });
+}
+
+if (isset($_GET['export'])) {
+    $export = trim((string) $_GET['export']);
+    if ($export === 'attendance-events') {
+        adminExportAttendanceEvents($conn);
+    } elseif ($export === 'attendance-sessions') {
+        adminExportAttendanceSessions($conn);
+    } elseif ($export === 'auth-events') {
+        adminExportAuthEvents($conn);
+    } elseif ($export === 'auth-sessions') {
+        adminExportAuthSessions($conn);
+    }
+}
+
 $total_users               = mysqli_fetch_assoc(mysqli_query($conn, "SELECT COUNT(*) AS total FROM users"))['total'];
 $total_reserved            = mysqli_fetch_assoc(mysqli_query($conn, "SELECT COUNT(*) AS total FROM seats WHERE status='reserved'"))['total'];
 $total_available           = mysqli_fetch_assoc(mysqli_query($conn, "SELECT COUNT(*) AS total FROM seats WHERE status='available'"))['total'];
@@ -164,6 +517,181 @@ $computers_query = mysqli_query($conn, "
     FROM computers
     LEFT JOIN users ON computers.reserved_by = users.id
 ");
+
+$attendanceLogAvailable = adminTableExists($conn, 'attendance');
+$attendanceHasUserId = $attendanceLogAvailable && adminColumnExists($conn, 'attendance', 'user_id');
+$attendanceHasDevice = $attendanceLogAvailable && adminColumnExists($conn, 'attendance', 'device');
+
+$attendanceEvents = [];
+$attendanceEventsTotal = 0;
+$attendanceEventsPerPage = 20;
+$attendanceEventsPage = adminClampPage($_GET['attPage'] ?? 1);
+$attendanceEventsTotalPages = 1;
+$attendanceEventsOffset = 0;
+$attendanceEventsStart = 0;
+$attendanceEventsEnd = 0;
+
+if ($attendanceLogAvailable) {
+    $countResult = mysqli_query($conn, 'SELECT COUNT(*) AS total FROM attendance');
+    $attendanceEventsTotal = (int) mysqli_fetch_assoc($countResult)['total'];
+    [$attendanceEventsPage, $attendanceEventsTotalPages, $attendanceEventsOffset, $attendanceEventsStart, $attendanceEventsEnd]
+        = adminPaginationState($attendanceEventsTotal, $attendanceEventsPerPage, $attendanceEventsPage);
+
+    $columns = ['a.id', 'a.name', 'a.uid', 'a.date', 'a.time', 'a.action', 'a.created_at'];
+    if ($attendanceHasDevice) {
+        $columns[] = 'a.device';
+    }
+    if ($attendanceHasUserId) {
+        $columns[] = 'a.user_id';
+        $columns[] = 'u.username';
+        $columns[] = 'u.role';
+        $columns[] = 'u.email';
+    }
+
+    $sql = 'SELECT ' . implode(', ', $columns) . ' FROM attendance a';
+    if ($attendanceHasUserId) {
+        $sql .= ' LEFT JOIN users u ON u.id = a.user_id';
+    }
+    $sql .= ' ORDER BY a.id DESC LIMIT ? OFFSET ?';
+
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param('ii', $attendanceEventsPerPage, $attendanceEventsOffset);
+    $stmt->execute();
+    $attendanceEvents = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+}
+
+$attendanceSessions = [];
+$attendanceSessionsTotal = 0;
+$attendanceSessionsPerPage = 15;
+$attendanceSessionsPage = adminClampPage($_GET['attSessionPage'] ?? 1);
+$attendanceSessionsTotalPages = 1;
+$attendanceSessionsOffset = 0;
+$attendanceSessionsStart = 0;
+$attendanceSessionsEnd = 0;
+
+if ($attendanceLogAvailable) {
+    $countResult = mysqli_query($conn, "SELECT COUNT(*) AS total FROM attendance WHERE action = 'TIME_IN'");
+    $attendanceSessionsTotal = (int) mysqli_fetch_assoc($countResult)['total'];
+    [$attendanceSessionsPage, $attendanceSessionsTotalPages, $attendanceSessionsOffset, $attendanceSessionsStart, $attendanceSessionsEnd]
+        = adminPaginationState($attendanceSessionsTotal, $attendanceSessionsPerPage, $attendanceSessionsPage);
+
+    $matchCondition = $attendanceHasUserId
+        ? "((a.user_id IS NOT NULL AND a2.user_id = a.user_id) OR (a.user_id IS NULL AND a2.uid = a.uid))"
+        : 'a2.uid = a.uid';
+
+    $timeOutDateSql = "SELECT a2.date FROM attendance a2 WHERE a2.action = 'TIME_OUT' AND a2.id > a.id AND {$matchCondition} ORDER BY a2.id ASC LIMIT 1";
+    $timeOutTimeSql = "SELECT a2.time FROM attendance a2 WHERE a2.action = 'TIME_OUT' AND a2.id > a.id AND {$matchCondition} ORDER BY a2.id ASC LIMIT 1";
+    $timeOutDeviceSql = $attendanceHasDevice
+        ? "SELECT a2.device FROM attendance a2 WHERE a2.action = 'TIME_OUT' AND a2.id > a.id AND {$matchCondition} ORDER BY a2.id ASC LIMIT 1"
+        : '';
+
+    $columns = [
+        'a.id AS time_in_id',
+        'a.user_id',
+        'a.name',
+        'a.uid',
+        'a.date AS time_in_date',
+        'a.time AS time_in_time',
+        $attendanceHasDevice ? 'a.device AS time_in_device' : null,
+        "({$timeOutDateSql}) AS time_out_date",
+        "({$timeOutTimeSql}) AS time_out_time",
+        $attendanceHasDevice ? "({$timeOutDeviceSql}) AS time_out_device" : null,
+    ];
+
+    if ($attendanceHasUserId) {
+        $columns[] = 'u.username';
+        $columns[] = 'u.role';
+        $columns[] = 'u.email';
+    }
+
+    $columns = array_values(array_filter($columns));
+
+    $sql = 'SELECT ' . implode(', ', $columns) . ' FROM attendance a';
+    if ($attendanceHasUserId) {
+        $sql .= ' LEFT JOIN users u ON u.id = a.user_id';
+    }
+    $sql .= " WHERE a.action = 'TIME_IN' ORDER BY a.id DESC LIMIT ? OFFSET ?";
+
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param('ii', $attendanceSessionsPerPage, $attendanceSessionsOffset);
+    $stmt->execute();
+    $attendanceSessions = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+
+    foreach ($attendanceSessions as &$row) {
+        $startStamp = strtotime(($row['time_in_date'] ?? '') . ' ' . ($row['time_in_time'] ?? ''));
+        $endStamp = strtotime(($row['time_out_date'] ?? '') . ' ' . ($row['time_out_time'] ?? ''));
+        if ($startStamp !== false && $endStamp !== false && $endStamp >= $startStamp) {
+            $row['duration_label'] = adminFormatDuration((int) ($endStamp - $startStamp));
+        } else {
+            $row['duration_label'] = 'Active';
+        }
+    }
+    unset($row);
+}
+
+$authLogAvailable = adminTableExists($conn, 'auth_log');
+$authEvents = [];
+$authEventsTotal = 0;
+$authEventsPerPage = 20;
+$authEventsPage = adminClampPage($_GET['authPage'] ?? 1);
+$authEventsTotalPages = 1;
+$authEventsOffset = 0;
+$authEventsStart = 0;
+$authEventsEnd = 0;
+
+if ($authLogAvailable) {
+    $countResult = mysqli_query($conn, 'SELECT COUNT(*) AS total FROM auth_log');
+    $authEventsTotal = (int) mysqli_fetch_assoc($countResult)['total'];
+    [$authEventsPage, $authEventsTotalPages, $authEventsOffset, $authEventsStart, $authEventsEnd]
+        = adminPaginationState($authEventsTotal, $authEventsPerPage, $authEventsPage);
+
+    $sql = 'SELECT id, user_id, username, role, identity, action, session_id, ip_address, user_agent, created_at '
+        . 'FROM auth_log ORDER BY id DESC LIMIT ? OFFSET ?';
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param('ii', $authEventsPerPage, $authEventsOffset);
+    $stmt->execute();
+    $authEvents = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+}
+
+$authSessions = [];
+$authSessionsTotal = 0;
+$authSessionsPerPage = 15;
+$authSessionsPage = adminClampPage($_GET['authSessionPage'] ?? 1);
+$authSessionsTotalPages = 1;
+$authSessionsOffset = 0;
+$authSessionsStart = 0;
+$authSessionsEnd = 0;
+
+if ($authLogAvailable) {
+    $countResult = mysqli_query($conn, "SELECT COUNT(*) AS total FROM auth_log WHERE action = 'login_success'");
+    $authSessionsTotal = (int) mysqli_fetch_assoc($countResult)['total'];
+    [$authSessionsPage, $authSessionsTotalPages, $authSessionsOffset, $authSessionsStart, $authSessionsEnd]
+        = adminPaginationState($authSessionsTotal, $authSessionsPerPage, $authSessionsPage);
+
+    $matchCondition = 'l2.session_id = l.session_id';
+    $sql = "SELECT l.id AS login_id, l.user_id, l.username, l.role, l.identity, l.session_id, l.ip_address, l.user_agent, l.created_at AS login_at,"
+        . " (SELECT l2.created_at FROM auth_log l2 WHERE l2.action = 'logout' AND l2.id > l.id AND {$matchCondition} ORDER BY l2.id ASC LIMIT 1) AS logout_at"
+        . " FROM auth_log l WHERE l.action = 'login_success' ORDER BY l.id DESC LIMIT ? OFFSET ?";
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param('ii', $authSessionsPerPage, $authSessionsOffset);
+    $stmt->execute();
+    $authSessions = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+
+    foreach ($authSessions as &$row) {
+        $startStamp = strtotime((string) ($row['login_at'] ?? ''));
+        $endStamp = strtotime((string) ($row['logout_at'] ?? ''));
+        if ($startStamp !== false && $endStamp !== false && $endStamp >= $startStamp) {
+            $row['duration_label'] = adminFormatDuration((int) ($endStamp - $startStamp));
+        } else {
+            $row['duration_label'] = 'Active';
+        }
+    }
+    unset($row);
+}
 
 $rfidUidByUserId = [];
 
@@ -597,6 +1125,24 @@ body {
     height: 1px;
     background: linear-gradient(to right, var(--glass-border), transparent);
 }
+
+.section-subtitle {
+    font-size: 0.98rem;
+    font-weight: 600;
+    color: var(--gold-light);
+    margin: 18px 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    letter-spacing: 0.02em;
+}
+
+.section-subtitle::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(to right, rgba(200,169,110,0.35), transparent);
+}
 .cards {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
@@ -738,12 +1284,39 @@ tbody tr:last-child td { border-bottom: none; }
     border: 1px solid rgba(34,197,94,0.28);
     color: #4ade80;
 }
+.badge.success {
+    background: rgba(34,197,94,0.12);
+    border: 1px solid rgba(34,197,94,0.28);
+    color: #4ade80;
+}
+.badge.warn {
+    background: rgba(245,158,11,0.12);
+    border: 1px solid rgba(245,158,11,0.30);
+    color: #fbbf24;
+}
+.badge.danger {
+    background: rgba(239,68,68,0.12);
+    border: 1px solid rgba(239,68,68,0.28);
+    color: #f87171;
+}
+.badge.info {
+    background: rgba(59,130,246,0.12);
+    border: 1px solid rgba(59,130,246,0.30);
+    color: #93c5fd;
+}
 .badge::before {
     content: '';
     width: 5px; height: 5px;
     border-radius: 50%;
     background: currentColor;
     flex-shrink: 0;
+}
+
+.cell-sub {
+    display: block;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-top: 4px;
 }
 
 .actions { display: flex; gap: 7px; flex-wrap: wrap; }
@@ -849,6 +1422,10 @@ tbody tr:last-child td { border-bottom: none; }
     font-weight: 600;
     cursor: pointer;
     transition: background var(--transition), border-color var(--transition), color var(--transition), transform var(--transition);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
 }
 
 .page-btn:hover:not(:disabled),
@@ -1136,6 +1713,40 @@ tbody tr:last-child td { border-bottom: none; }
 @media (max-width: 380px) {
     .cards { grid-template-columns: 1fr 1fr; }
 }
+
+@media print {
+    body {
+        background: #fff;
+        color: #111;
+    }
+    .bg-layer,
+    .bg-overlay,
+    .sidebar,
+    .topbar,
+    .drawer-overlay,
+    .no-print {
+        display: none !important;
+    }
+    .main-content {
+        padding: 0;
+    }
+    .section {
+        display: none !important;
+    }
+    #logs {
+        display: block !important;
+    }
+    .table-wrap {
+        box-shadow: none;
+        border: 1px solid #ccc;
+    }
+    th {
+        color: #111;
+    }
+    td {
+        color: #222;
+    }
+}
 </style>
 </head>
 <body>
@@ -1179,6 +1790,9 @@ tbody tr:last-child td { border-bottom: none; }
         </button>
         <button class="tab-button <?= $initialTab === 'rfid-portal' ? 'active' : '' ?>" data-tab="rfid-portal">
             <span class="nav-icon">📡</span> RFID Portal
+        </button>
+        <button class="tab-button <?= $initialTab === 'logs' ? 'active' : '' ?>" data-tab="logs">
+            <span class="nav-icon">📋</span> Logs
         </button>
         <?php if ($isSuperadmin): ?>
         <button class="tab-button <?= $initialTab === 'system-hours' ? 'active' : '' ?>" data-tab="system-hours">
@@ -1499,6 +2113,416 @@ tbody tr:last-child td { border-bottom: none; }
             </div>
         </section>
 
+        <!-- ══════ LOGS SECTION ══════ -->
+        <section id="logs" class="section <?= $initialTab === 'logs' ? 'active' : '' ?>">
+            <div class="section-title">Login &amp; Attendance Logs</div>
+
+            <div class="welcome-box" style="margin-bottom:14px;">
+                Review RFID attendance activity and web login/logout history, including failed login attempts.
+            </div>
+
+            <div class="rfid-actions-grid no-print" style="margin-bottom:14px;">
+                <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'export' => 'attendance-events', 'attPage' => null])) ?>">⬇️ Export Attendance Events CSV</a>
+                <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'export' => 'attendance-sessions', 'attSessionPage' => null])) ?>">⬇️ Export Attendance Sessions CSV</a>
+                <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'export' => 'auth-events', 'authPage' => null])) ?>">⬇️ Export Login Events CSV</a>
+                <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'export' => 'auth-sessions', 'authSessionPage' => null])) ?>">⬇️ Export Login Sessions CSV</a>
+                <button type="button" class="rfid-btn warn" id="btnPrintLogs">🖨️ Print Logs</button>
+            </div>
+
+            <div class="section-subtitle">RFID Attendance Events</div>
+
+            <div class="table-wrap">
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date &amp; Time</th>
+                                <th>Action</th>
+                                <th>User</th>
+                                <th>UID</th>
+                                <th>Device</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php if (!$attendanceLogAvailable): ?>
+                                <tr class="empty-row"><td colspan="5">Attendance log table not available.</td></tr>
+                            <?php elseif (empty($attendanceEvents)): ?>
+                                <tr class="empty-row"><td colspan="5">No attendance events found.</td></tr>
+                            <?php else: ?>
+                                <?php foreach ($attendanceEvents as $row): ?>
+                                    <?php
+                                    $userLabel = '—';
+                                    $userMeta = '';
+                                    $rowUserId = (int) ($row['user_id'] ?? 0);
+                                    if (!empty($row['username'])) {
+                                        $userLabel = (string) $row['username'];
+                                    } elseif (!empty($row['name'])) {
+                                        $userLabel = (string) $row['name'];
+                                    } elseif ($rowUserId > 0) {
+                                        $userLabel = 'User #' . $rowUserId;
+                                    }
+                                    if (!empty($row['role'])) {
+                                        $userMeta = ucfirst((string) $row['role']);
+                                    }
+                                    $action = strtoupper((string) ($row['action'] ?? ''));
+                                    $actionClass = $action === 'TIME_IN' ? 'success' : 'warn';
+                                    ?>
+                                    <tr>
+                                        <td><?= htmlspecialchars(adminFormatDateTime($row['date'] ?? '', $row['time'] ?? '')) ?></td>
+                                        <td><span class="badge <?= $actionClass ?>"><?= htmlspecialchars($action) ?></span></td>
+                                        <td>
+                                            <span style="font-weight:600; color:var(--text-main);">
+                                                <?= htmlspecialchars($userLabel) ?>
+                                            </span>
+                                            <?php if ($userMeta !== ''): ?>
+                                                <span class="cell-sub"><?= htmlspecialchars($userMeta) ?></span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace; font-size:0.80rem; color:var(--text-sub);">
+                                            <?= htmlspecialchars((string) ($row['uid'] ?? '—')) ?>
+                                        </td>
+                                        <td><?= htmlspecialchars((string) ($row['device'] ?? '—')) ?></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <?php if ($attendanceLogAvailable && $attendanceEventsTotalPages > 1): ?>
+                    <div class="table-pagination">
+                        <div class="pagination-meta">
+                            Showing <?= $attendanceEventsStart ?>-<?= $attendanceEventsEnd ?> of <?= $attendanceEventsTotal ?> events
+                        </div>
+                        <div class="pagination-controls">
+                            <?php if ($attendanceEventsPage > 1): ?>
+                                <a class="page-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'attPage' => $attendanceEventsPage - 1])) ?>">Prev</a>
+                            <?php else: ?>
+                                <button type="button" class="page-btn" disabled>Prev</button>
+                            <?php endif; ?>
+                            <div class="pagination-pages" aria-label="Attendance event page list">
+                                <?php foreach (adminPaginationTokens($attendanceEventsTotalPages, $attendanceEventsPage) as $token): ?>
+                                    <?php if (!is_int($token)): ?>
+                                        <span class="page-ellipsis">…</span>
+                                    <?php elseif ($token === $attendanceEventsPage): ?>
+                                        <button type="button" class="page-number" aria-current="page" disabled><?= $token ?></button>
+                                    <?php else: ?>
+                                        <a class="page-number" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'attPage' => $token])) ?>"><?= $token ?></a>
+                                    <?php endif; ?>
+                                <?php endforeach; ?>
+                            </div>
+                            <?php if ($attendanceEventsPage < $attendanceEventsTotalPages): ?>
+                                <a class="page-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'attPage' => $attendanceEventsPage + 1])) ?>">Next</a>
+                            <?php else: ?>
+                                <button type="button" class="page-btn" disabled>Next</button>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                <?php endif; ?>
+            </div>
+
+            <div class="section-subtitle">RFID Attendance Sessions</div>
+
+            <div class="table-wrap">
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Time In</th>
+                                <th>Time Out</th>
+                                <th>Duration</th>
+                                <th>User</th>
+                                <th>UID</th>
+                                <th>Device</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php if (!$attendanceLogAvailable): ?>
+                                <tr class="empty-row"><td colspan="6">Attendance log table not available.</td></tr>
+                            <?php elseif (empty($attendanceSessions)): ?>
+                                <tr class="empty-row"><td colspan="6">No attendance sessions found.</td></tr>
+                            <?php else: ?>
+                                <?php foreach ($attendanceSessions as $row): ?>
+                                    <?php
+                                    $userLabel = '—';
+                                    $userMeta = '';
+                                    $rowUserId = (int) ($row['user_id'] ?? 0);
+                                    if (!empty($row['username'])) {
+                                        $userLabel = (string) $row['username'];
+                                    } elseif (!empty($row['name'])) {
+                                        $userLabel = (string) $row['name'];
+                                    } elseif ($rowUserId > 0) {
+                                        $userLabel = 'User #' . $rowUserId;
+                                    }
+                                    if (!empty($row['role'])) {
+                                        $userMeta = ucfirst((string) $row['role']);
+                                    }
+                                    $deviceLabel = '—';
+                                    $inDevice = (string) ($row['time_in_device'] ?? '');
+                                    $outDevice = (string) ($row['time_out_device'] ?? '');
+                                    if ($inDevice !== '' || $outDevice !== '') {
+                                        if ($inDevice !== '' && $outDevice !== '' && $outDevice !== $inDevice) {
+                                            $deviceLabel = $inDevice . ' / ' . $outDevice;
+                                        } else {
+                                            $deviceLabel = $inDevice !== '' ? $inDevice : $outDevice;
+                                        }
+                                    }
+                                    $timeOutDisplay = adminFormatDateTime($row['time_out_date'] ?? '', $row['time_out_time'] ?? '');
+                                    ?>
+                                    <tr>
+                                        <td><?= htmlspecialchars(adminFormatDateTime($row['time_in_date'] ?? '', $row['time_in_time'] ?? '')) ?></td>
+                                        <td><?= htmlspecialchars($timeOutDisplay) ?></td>
+                                        <td>
+                                            <?php if (($row['duration_label'] ?? '') === 'Active'): ?>
+                                                <span class="badge info">Active</span>
+                                            <?php else: ?>
+                                                <?= htmlspecialchars((string) ($row['duration_label'] ?? '—')) ?>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <span style="font-weight:600; color:var(--text-main);">
+                                                <?= htmlspecialchars($userLabel) ?>
+                                            </span>
+                                            <?php if ($userMeta !== ''): ?>
+                                                <span class="cell-sub"><?= htmlspecialchars($userMeta) ?></span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace; font-size:0.80rem; color:var(--text-sub);">
+                                            <?= htmlspecialchars((string) ($row['uid'] ?? '—')) ?>
+                                        </td>
+                                        <td><?= htmlspecialchars($deviceLabel) ?></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <?php if ($attendanceLogAvailable && $attendanceSessionsTotalPages > 1): ?>
+                    <div class="table-pagination">
+                        <div class="pagination-meta">
+                            Showing <?= $attendanceSessionsStart ?>-<?= $attendanceSessionsEnd ?> of <?= $attendanceSessionsTotal ?> sessions
+                        </div>
+                        <div class="pagination-controls">
+                            <?php if ($attendanceSessionsPage > 1): ?>
+                                <a class="page-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'attSessionPage' => $attendanceSessionsPage - 1])) ?>">Prev</a>
+                            <?php else: ?>
+                                <button type="button" class="page-btn" disabled>Prev</button>
+                            <?php endif; ?>
+                            <div class="pagination-pages" aria-label="Attendance session page list">
+                                <?php foreach (adminPaginationTokens($attendanceSessionsTotalPages, $attendanceSessionsPage) as $token): ?>
+                                    <?php if (!is_int($token)): ?>
+                                        <span class="page-ellipsis">…</span>
+                                    <?php elseif ($token === $attendanceSessionsPage): ?>
+                                        <button type="button" class="page-number" aria-current="page" disabled><?= $token ?></button>
+                                    <?php else: ?>
+                                        <a class="page-number" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'attSessionPage' => $token])) ?>"><?= $token ?></a>
+                                    <?php endif; ?>
+                                <?php endforeach; ?>
+                            </div>
+                            <?php if ($attendanceSessionsPage < $attendanceSessionsTotalPages): ?>
+                                <a class="page-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'attSessionPage' => $attendanceSessionsPage + 1])) ?>">Next</a>
+                            <?php else: ?>
+                                <button type="button" class="page-btn" disabled>Next</button>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                <?php endif; ?>
+            </div>
+
+            <div class="section-subtitle">Web Login Events</div>
+
+            <div class="table-wrap">
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date &amp; Time</th>
+                                <th>Action</th>
+                                <th>User / Identity</th>
+                                <th>Role</th>
+                                <th>IP Address</th>
+                                <th>Session</th>
+                                <th>User Agent</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php if (!$authLogAvailable): ?>
+                                <tr class="empty-row"><td colspan="7">Auth log table not available.</td></tr>
+                            <?php elseif (empty($authEvents)): ?>
+                                <tr class="empty-row"><td colspan="7">No login events found.</td></tr>
+                            <?php else: ?>
+                                <?php foreach ($authEvents as $row): ?>
+                                    <?php
+                                    $action = (string) ($row['action'] ?? '');
+                                    $actionLabel = $action;
+                                    $actionClass = 'info';
+                                    if ($action === 'login_success') {
+                                        $actionLabel = 'Login';
+                                        $actionClass = 'success';
+                                    } elseif ($action === 'login_failed') {
+                                        $actionLabel = 'Login Failed';
+                                        $actionClass = 'danger';
+                                    } elseif ($action === 'logout') {
+                                        $actionLabel = 'Logout';
+                                        $actionClass = 'warn';
+                                    }
+                                    $identity = (string) ($row['identity'] ?? '');
+                                    $username = (string) ($row['username'] ?? '');
+                                    $userLabel = $username !== '' ? $username : ($identity !== '' ? $identity : '—');
+                                    $userMeta = ($username !== '' && $identity !== '' && $identity !== $username) ? ('ID: ' . $identity) : '';
+                                    $sessionFull = (string) ($row['session_id'] ?? '');
+                                    $sessionShort = $sessionFull !== '' ? adminTruncate($sessionFull, 12) : '—';
+                                    $agentFull = (string) ($row['user_agent'] ?? '');
+                                    $agentShort = $agentFull !== '' ? adminTruncate($agentFull, 48) : '—';
+                                    ?>
+                                    <tr>
+                                        <td><?= htmlspecialchars(adminFormatTimestamp($row['created_at'] ?? '')) ?></td>
+                                        <td><span class="badge <?= $actionClass ?>"><?= htmlspecialchars($actionLabel) ?></span></td>
+                                        <td>
+                                            <span style="font-weight:600; color:var(--text-main);">
+                                                <?= htmlspecialchars($userLabel) ?>
+                                            </span>
+                                            <?php if ($userMeta !== ''): ?>
+                                                <span class="cell-sub"><?= htmlspecialchars($userMeta) ?></span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td><?= htmlspecialchars($row['role'] !== null && $row['role'] !== '' ? ucfirst((string) $row['role']) : '—') ?></td>
+                                        <td><?= htmlspecialchars((string) ($row['ip_address'] ?? '—')) ?></td>
+                                        <td title="<?= htmlspecialchars($sessionFull) ?>" style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace; font-size:0.80rem; color:var(--text-sub);">
+                                            <?= htmlspecialchars($sessionShort) ?>
+                                        </td>
+                                        <td title="<?= htmlspecialchars($agentFull) ?>">
+                                            <?= htmlspecialchars($agentShort) ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <?php if ($authLogAvailable && $authEventsTotalPages > 1): ?>
+                    <div class="table-pagination">
+                        <div class="pagination-meta">
+                            Showing <?= $authEventsStart ?>-<?= $authEventsEnd ?> of <?= $authEventsTotal ?> events
+                        </div>
+                        <div class="pagination-controls">
+                            <?php if ($authEventsPage > 1): ?>
+                                <a class="page-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'authPage' => $authEventsPage - 1])) ?>">Prev</a>
+                            <?php else: ?>
+                                <button type="button" class="page-btn" disabled>Prev</button>
+                            <?php endif; ?>
+                            <div class="pagination-pages" aria-label="Auth event page list">
+                                <?php foreach (adminPaginationTokens($authEventsTotalPages, $authEventsPage) as $token): ?>
+                                    <?php if (!is_int($token)): ?>
+                                        <span class="page-ellipsis">…</span>
+                                    <?php elseif ($token === $authEventsPage): ?>
+                                        <button type="button" class="page-number" aria-current="page" disabled><?= $token ?></button>
+                                    <?php else: ?>
+                                        <a class="page-number" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'authPage' => $token])) ?>"><?= $token ?></a>
+                                    <?php endif; ?>
+                                <?php endforeach; ?>
+                            </div>
+                            <?php if ($authEventsPage < $authEventsTotalPages): ?>
+                                <a class="page-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'authPage' => $authEventsPage + 1])) ?>">Next</a>
+                            <?php else: ?>
+                                <button type="button" class="page-btn" disabled>Next</button>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                <?php endif; ?>
+            </div>
+
+            <div class="section-subtitle">Web Login Sessions</div>
+
+            <div class="table-wrap">
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Login</th>
+                                <th>Logout</th>
+                                <th>Duration</th>
+                                <th>User / Identity</th>
+                                <th>IP Address</th>
+                                <th>Session</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php if (!$authLogAvailable): ?>
+                                <tr class="empty-row"><td colspan="6">Auth log table not available.</td></tr>
+                            <?php elseif (empty($authSessions)): ?>
+                                <tr class="empty-row"><td colspan="6">No login sessions found.</td></tr>
+                            <?php else: ?>
+                                <?php foreach ($authSessions as $row): ?>
+                                    <?php
+                                    $identity = (string) ($row['identity'] ?? '');
+                                    $username = (string) ($row['username'] ?? '');
+                                    $userLabel = $username !== '' ? $username : ($identity !== '' ? $identity : '—');
+                                    $userMeta = ($username !== '' && $identity !== '' && $identity !== $username) ? ('ID: ' . $identity) : '';
+                                    $sessionFull = (string) ($row['session_id'] ?? '');
+                                    $sessionShort = $sessionFull !== '' ? adminTruncate($sessionFull, 12) : '—';
+                                    $logoutLabel = adminFormatTimestamp($row['logout_at'] ?? '');
+                                    ?>
+                                    <tr>
+                                        <td><?= htmlspecialchars(adminFormatTimestamp($row['login_at'] ?? '')) ?></td>
+                                        <td><?= htmlspecialchars($logoutLabel) ?></td>
+                                        <td>
+                                            <?php if (($row['duration_label'] ?? '') === 'Active'): ?>
+                                                <span class="badge info">Active</span>
+                                            <?php else: ?>
+                                                <?= htmlspecialchars((string) ($row['duration_label'] ?? '—')) ?>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <span style="font-weight:600; color:var(--text-main);">
+                                                <?= htmlspecialchars($userLabel) ?>
+                                            </span>
+                                            <?php if ($userMeta !== ''): ?>
+                                                <span class="cell-sub"><?= htmlspecialchars($userMeta) ?></span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td><?= htmlspecialchars((string) ($row['ip_address'] ?? '—')) ?></td>
+                                        <td title="<?= htmlspecialchars($sessionFull) ?>" style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace; font-size:0.80rem; color:var(--text-sub);">
+                                            <?= htmlspecialchars($sessionShort) ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <?php if ($authLogAvailable && $authSessionsTotalPages > 1): ?>
+                    <div class="table-pagination">
+                        <div class="pagination-meta">
+                            Showing <?= $authSessionsStart ?>-<?= $authSessionsEnd ?> of <?= $authSessionsTotal ?> sessions
+                        </div>
+                        <div class="pagination-controls">
+                            <?php if ($authSessionsPage > 1): ?>
+                                <a class="page-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'authSessionPage' => $authSessionsPage - 1])) ?>">Prev</a>
+                            <?php else: ?>
+                                <button type="button" class="page-btn" disabled>Prev</button>
+                            <?php endif; ?>
+                            <div class="pagination-pages" aria-label="Auth session page list">
+                                <?php foreach (adminPaginationTokens($authSessionsTotalPages, $authSessionsPage) as $token): ?>
+                                    <?php if (!is_int($token)): ?>
+                                        <span class="page-ellipsis">…</span>
+                                    <?php elseif ($token === $authSessionsPage): ?>
+                                        <button type="button" class="page-number" aria-current="page" disabled><?= $token ?></button>
+                                    <?php else: ?>
+                                        <a class="page-number" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'authSessionPage' => $token])) ?>"><?= $token ?></a>
+                                    <?php endif; ?>
+                                <?php endforeach; ?>
+                            </div>
+                            <?php if ($authSessionsPage < $authSessionsTotalPages): ?>
+                                <a class="page-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'authSessionPage' => $authSessionsPage + 1])) ?>">Next</a>
+                            <?php else: ?>
+                                <button type="button" class="page-btn" disabled>Next</button>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                <?php endif; ?>
+            </div>
+        </section>
+
         <?php if ($isSuperadmin): ?>
         <section id="system-hours" class="section <?= $initialTab === 'system-hours' ? 'active' : '' ?>">
             <div class="section-title">System Operating Hours</div>
@@ -1722,6 +2746,7 @@ const btnCheckRfidPortal = document.getElementById('btnCheckRfidPortal');
 const btnClearOfflineQueue = document.getElementById('btnClearOfflineQueue');
 const btnResetOfflineSessions = document.getElementById('btnResetOfflineSessions');
 const rfidResetUid = document.getElementById('rfidResetUid');
+const btnPrintLogs = document.getElementById('btnPrintLogs');
 
 function showRfidMessage(type, text) {
     if (!rfidOpsMessage) return;
@@ -1812,6 +2837,10 @@ if (btnResetOfflineSessions) {
             showRfidMessage('warn', err.message || 'Session reset is unavailable on this firmware.');
         }
     });
+}
+
+if (btnPrintLogs) {
+    btnPrintLogs.addEventListener('click', () => window.print());
 }
 
 /* ── Mobile sidebar ── */

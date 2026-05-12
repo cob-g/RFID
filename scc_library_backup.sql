@@ -27,6 +27,19 @@ CREATE TABLE `attendance` (
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE `auth_log` (
+  `id` int(11) NOT NULL,
+  `user_id` int(11) DEFAULT NULL,
+  `username` varchar(80) DEFAULT NULL,
+  `role` varchar(30) DEFAULT NULL,
+  `identity` varchar(120) DEFAULT NULL,
+  `action` enum('login_success','login_failed','logout') NOT NULL,
+  `session_id` varchar(128) DEFAULT NULL,
+  `ip_address` varchar(45) DEFAULT NULL,
+  `user_agent` varchar(255) DEFAULT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
 
 CREATE TABLE `rfid_cards` (
   `id` int(11) NOT NULL,
@@ -247,6 +260,16 @@ ALTER TABLE `attendance`
   ADD KEY `idx_date_action` (`date`,`action`);
 
 --
+-- Indexes for table `auth_log`
+--
+ALTER TABLE `auth_log`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_auth_user` (`user_id`),
+  ADD KEY `idx_auth_action_time` (`action`,`created_at`),
+  ADD KEY `idx_auth_session` (`session_id`),
+  ADD KEY `idx_auth_identity` (`identity`);
+
+--
 -- Indexes for table `computers`
 --
 ALTER TABLE `computers`
@@ -331,6 +354,12 @@ ALTER TABLE `attendance`
   MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
 
 --
+-- AUTO_INCREMENT for table `auth_log`
+--
+ALTER TABLE `auth_log`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
 -- AUTO_INCREMENT for table `computers`
 --
 ALTER TABLE `computers`
@@ -387,6 +416,12 @@ ALTER TABLE `allocation_log`
 --
 ALTER TABLE `attendance`
   ADD CONSTRAINT `fk_att_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE SET NULL;
+
+--
+-- Constraints for table `auth_log`
+--
+ALTER TABLE `auth_log`
+  ADD CONSTRAINT `auth_log_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE SET NULL ON UPDATE CASCADE;
 
 --
 -- Constraints for table `computers`

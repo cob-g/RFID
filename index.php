@@ -25,6 +25,18 @@ if (isset($_POST['login'])) {
                 $_SESSION['username'] = $user['username'];
                 $_SESSION['role'] = $user['role'];
                 $_SESSION['email'] = $user['email'];
+
+                authLogWrite($conn, [
+                    'user_id' => (int) $user['id'],
+                    'username' => (string) $user['username'],
+                    'role' => (string) $user['role'],
+                    'identity' => (string) $username,
+                    'action' => 'login_success',
+                    'session_id' => session_id(),
+                    'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
+                    'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? '',
+                ]);
+
                 switch ($user['role']) {
                     case "admin":
                     case "superadmin":
@@ -42,9 +54,26 @@ if (isset($_POST['login'])) {
                         $message = "Undefined role. Contact administrator.";
                 }
             } else {
+                authLogWrite($conn, [
+                    'user_id' => (int) $user['id'],
+                    'username' => (string) $user['username'],
+                    'role' => (string) $user['role'],
+                    'identity' => (string) $username,
+                    'action' => 'login_failed',
+                    'session_id' => session_id(),
+                    'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
+                    'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? '',
+                ]);
                 $message = "Invalid username or password.";
             }
         } else {
+            authLogWrite($conn, [
+                'identity' => (string) $username,
+                'action' => 'login_failed',
+                'session_id' => session_id(),
+                'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
+                'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? '',
+            ]);
             $message = "Invalid username or password.";
         }
     }
