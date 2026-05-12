@@ -91,9 +91,23 @@ if (!empty($_SESSION['redirect_to_users'])) {
     unset($_SESSION['redirect_to_users']);
 }
 
+$printMode = trim((string) ($_GET['print'] ?? ''));
+$isPrintLogs = ($printMode === 'logs');
+if ($isPrintLogs) {
+    $initialTab = 'logs';
+}
+
 $pageSuccess = isset($_SESSION['success']) ? (string) $_SESSION['success'] : '';
 $pageError = isset($_SESSION['error']) ? (string) $_SESSION['error'] : '';
 unset($_SESSION['success'], $_SESSION['error']);
+
+$reportGeneratedAt = date('M j, Y g:i A');
+$reportPreparedBy = trim((string) ($_SESSION['username'] ?? ''));
+if ($reportPreparedBy === '') {
+    $reportPreparedBy = 'Admin';
+}
+$reportPreparedRole = $current_role !== '' ? ucfirst($current_role) : 'Admin';
+$reportFiltersLabel = 'All records';
 
 $rfidPortalUrl = getenv('RFID_PORTAL_URL');
 if ($rfidPortalUrl === false || trim($rfidPortalUrl) === '') {
@@ -215,7 +229,7 @@ function adminFormatDateTime(?string $date, ?string $time): string
         return '—';
     }
 
-    return date('M j, Y H:i', $stamp);
+    return date('M j, Y g:i A', $stamp);
 }
 
 function adminFormatTimestamp(?string $timestamp): string
@@ -230,7 +244,7 @@ function adminFormatTimestamp(?string $timestamp): string
         return '—';
     }
 
-    return date('M j, Y H:i', $stamp);
+    return date('M j, Y g:i A', $stamp);
 }
 
 function adminFormatDuration(int $seconds): string
@@ -521,10 +535,15 @@ $attendanceLogAvailable = adminTableExists($conn, 'attendance');
 $attendanceHasUserId = $attendanceLogAvailable && adminColumnExists($conn, 'attendance', 'user_id');
 $attendanceHasDevice = $attendanceLogAvailable && adminColumnExists($conn, 'attendance', 'device');
 
+$attendanceTimeInTotal = 0;
+$attendanceTimeOutTotal = 0;
+$authLoginSuccessTotal = 0;
+$authLoginFailedTotal = 0;
+
 $attendanceEvents = [];
 $attendanceEventsTotal = 0;
 $attendanceEventsPerPage = 20;
-$attendanceEventsPage = adminClampPage($_GET['attPage'] ?? 1);
+$attendanceEventsPage = $isPrintLogs ? 1 : adminClampPage($_GET['attPage'] ?? 1);
 $attendanceEventsTotalPages = 1;
 $attendanceEventsOffset = 0;
 $attendanceEventsStart = 0;
@@ -533,8 +552,16 @@ $attendanceEventsEnd = 0;
 if ($attendanceLogAvailable) {
     $countResult = mysqli_query($conn, 'SELECT COUNT(*) AS total FROM attendance');
     $attendanceEventsTotal = (int) mysqli_fetch_assoc($countResult)['total'];
-    [$attendanceEventsPage, $attendanceEventsTotalPages, $attendanceEventsOffset, $attendanceEventsStart, $attendanceEventsEnd]
-        = adminPaginationState($attendanceEventsTotal, $attendanceEventsPerPage, $attendanceEventsPage);
+    if ($isPrintLogs) {
+        $attendanceEventsPage = 1;
+        $attendanceEventsTotalPages = 1;
+        $attendanceEventsOffset = 0;
+        $attendanceEventsStart = $attendanceEventsTotal > 0 ? 1 : 0;
+        $attendanceEventsEnd = $attendanceEventsTotal;
+    } else {
+        [$attendanceEventsPage, $attendanceEventsTotalPages, $attendanceEventsOffset, $attendanceEventsStart, $attendanceEventsEnd]
+            = adminPaginationState($attendanceEventsTotal, $attendanceEventsPerPage, $attendanceEventsPage);
+    }
 
     $columns = ['a.id', 'a.name', 'a.uid', 'a.date', 'a.time', 'a.action', 'a.created_at'];
     if ($attendanceHasDevice) {
@@ -551,10 +578,15 @@ if ($attendanceLogAvailable) {
     if ($attendanceHasUserId) {
         $sql .= ' LEFT JOIN users u ON u.id = a.user_id';
     }
-    $sql .= ' ORDER BY a.id DESC LIMIT ? OFFSET ?';
+    $sql .= ' ORDER BY a.id DESC';
+    if (!$isPrintLogs) {
+        $sql .= ' LIMIT ? OFFSET ?';
+    }
 
     $stmt = $conn->prepare($sql);
-    $stmt->bind_param('ii', $attendanceEventsPerPage, $attendanceEventsOffset);
+    if (!$isPrintLogs) {
+        $stmt->bind_param('ii', $attendanceEventsPerPage, $attendanceEventsOffset);
+    }
     $stmt->execute();
     $attendanceEvents = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
@@ -563,7 +595,7 @@ if ($attendanceLogAvailable) {
 $attendanceSessions = [];
 $attendanceSessionsTotal = 0;
 $attendanceSessionsPerPage = 15;
-$attendanceSessionsPage = adminClampPage($_GET['attSessionPage'] ?? 1);
+$attendanceSessionsPage = $isPrintLogs ? 1 : adminClampPage($_GET['attSessionPage'] ?? 1);
 $attendanceSessionsTotalPages = 1;
 $attendanceSessionsOffset = 0;
 $attendanceSessionsStart = 0;
@@ -572,8 +604,16 @@ $attendanceSessionsEnd = 0;
 if ($attendanceLogAvailable) {
     $countResult = mysqli_query($conn, "SELECT COUNT(*) AS total FROM attendance WHERE action = 'TIME_IN'");
     $attendanceSessionsTotal = (int) mysqli_fetch_assoc($countResult)['total'];
-    [$attendanceSessionsPage, $attendanceSessionsTotalPages, $attendanceSessionsOffset, $attendanceSessionsStart, $attendanceSessionsEnd]
-        = adminPaginationState($attendanceSessionsTotal, $attendanceSessionsPerPage, $attendanceSessionsPage);
+    if ($isPrintLogs) {
+        $attendanceSessionsPage = 1;
+        $attendanceSessionsTotalPages = 1;
+        $attendanceSessionsOffset = 0;
+        $attendanceSessionsStart = $attendanceSessionsTotal > 0 ? 1 : 0;
+        $attendanceSessionsEnd = $attendanceSessionsTotal;
+    } else {
+        [$attendanceSessionsPage, $attendanceSessionsTotalPages, $attendanceSessionsOffset, $attendanceSessionsStart, $attendanceSessionsEnd]
+            = adminPaginationState($attendanceSessionsTotal, $attendanceSessionsPerPage, $attendanceSessionsPage);
+    }
 
     $matchCondition = $attendanceHasUserId
         ? "((a.user_id IS NOT NULL AND a2.user_id = a.user_id) OR (a.user_id IS NULL AND a2.uid = a.uid))"
@@ -610,10 +650,15 @@ if ($attendanceLogAvailable) {
     if ($attendanceHasUserId) {
         $sql .= ' LEFT JOIN users u ON u.id = a.user_id';
     }
-    $sql .= " WHERE a.action = 'TIME_IN' ORDER BY a.id DESC LIMIT ? OFFSET ?";
+    $sql .= " WHERE a.action = 'TIME_IN' ORDER BY a.id DESC";
+    if (!$isPrintLogs) {
+        $sql .= ' LIMIT ? OFFSET ?';
+    }
 
     $stmt = $conn->prepare($sql);
-    $stmt->bind_param('ii', $attendanceSessionsPerPage, $attendanceSessionsOffset);
+    if (!$isPrintLogs) {
+        $stmt->bind_param('ii', $attendanceSessionsPerPage, $attendanceSessionsOffset);
+    }
     $stmt->execute();
     $attendanceSessions = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
@@ -630,11 +675,17 @@ if ($attendanceLogAvailable) {
     unset($row);
 }
 
+$attendanceTimeInTotal = $attendanceSessionsTotal;
+if ($attendanceLogAvailable) {
+    $countResult = mysqli_query($conn, "SELECT COUNT(*) AS total FROM attendance WHERE action = 'TIME_OUT'");
+    $attendanceTimeOutTotal = (int) mysqli_fetch_assoc($countResult)['total'];
+}
+
 $authLogAvailable = adminTableExists($conn, 'auth_log');
 $authEvents = [];
 $authEventsTotal = 0;
 $authEventsPerPage = 20;
-$authEventsPage = adminClampPage($_GET['authPage'] ?? 1);
+$authEventsPage = $isPrintLogs ? 1 : adminClampPage($_GET['authPage'] ?? 1);
 $authEventsTotalPages = 1;
 $authEventsOffset = 0;
 $authEventsStart = 0;
@@ -643,13 +694,26 @@ $authEventsEnd = 0;
 if ($authLogAvailable) {
     $countResult = mysqli_query($conn, 'SELECT COUNT(*) AS total FROM auth_log');
     $authEventsTotal = (int) mysqli_fetch_assoc($countResult)['total'];
-    [$authEventsPage, $authEventsTotalPages, $authEventsOffset, $authEventsStart, $authEventsEnd]
-        = adminPaginationState($authEventsTotal, $authEventsPerPage, $authEventsPage);
+    if ($isPrintLogs) {
+        $authEventsPage = 1;
+        $authEventsTotalPages = 1;
+        $authEventsOffset = 0;
+        $authEventsStart = $authEventsTotal > 0 ? 1 : 0;
+        $authEventsEnd = $authEventsTotal;
+    } else {
+        [$authEventsPage, $authEventsTotalPages, $authEventsOffset, $authEventsStart, $authEventsEnd]
+            = adminPaginationState($authEventsTotal, $authEventsPerPage, $authEventsPage);
+    }
 
     $sql = 'SELECT id, user_id, username, role, identity, action, session_id, ip_address, user_agent, created_at '
-        . 'FROM auth_log ORDER BY id DESC LIMIT ? OFFSET ?';
+        . 'FROM auth_log ORDER BY id DESC';
+    if (!$isPrintLogs) {
+        $sql .= ' LIMIT ? OFFSET ?';
+    }
     $stmt = $conn->prepare($sql);
-    $stmt->bind_param('ii', $authEventsPerPage, $authEventsOffset);
+    if (!$isPrintLogs) {
+        $stmt->bind_param('ii', $authEventsPerPage, $authEventsOffset);
+    }
     $stmt->execute();
     $authEvents = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
@@ -658,7 +722,7 @@ if ($authLogAvailable) {
 $authSessions = [];
 $authSessionsTotal = 0;
 $authSessionsPerPage = 15;
-$authSessionsPage = adminClampPage($_GET['authSessionPage'] ?? 1);
+$authSessionsPage = $isPrintLogs ? 1 : adminClampPage($_GET['authSessionPage'] ?? 1);
 $authSessionsTotalPages = 1;
 $authSessionsOffset = 0;
 $authSessionsStart = 0;
@@ -667,15 +731,28 @@ $authSessionsEnd = 0;
 if ($authLogAvailable) {
     $countResult = mysqli_query($conn, "SELECT COUNT(*) AS total FROM auth_log WHERE action = 'login_success'");
     $authSessionsTotal = (int) mysqli_fetch_assoc($countResult)['total'];
-    [$authSessionsPage, $authSessionsTotalPages, $authSessionsOffset, $authSessionsStart, $authSessionsEnd]
-        = adminPaginationState($authSessionsTotal, $authSessionsPerPage, $authSessionsPage);
+    if ($isPrintLogs) {
+        $authSessionsPage = 1;
+        $authSessionsTotalPages = 1;
+        $authSessionsOffset = 0;
+        $authSessionsStart = $authSessionsTotal > 0 ? 1 : 0;
+        $authSessionsEnd = $authSessionsTotal;
+    } else {
+        [$authSessionsPage, $authSessionsTotalPages, $authSessionsOffset, $authSessionsStart, $authSessionsEnd]
+            = adminPaginationState($authSessionsTotal, $authSessionsPerPage, $authSessionsPage);
+    }
 
     $matchCondition = 'l2.session_id = l.session_id';
     $sql = "SELECT l.id AS login_id, l.user_id, l.username, l.role, l.identity, l.session_id, l.ip_address, l.user_agent, l.created_at AS login_at,"
         . " (SELECT l2.created_at FROM auth_log l2 WHERE l2.action = 'logout' AND l2.id > l.id AND {$matchCondition} ORDER BY l2.id ASC LIMIT 1) AS logout_at"
-        . " FROM auth_log l WHERE l.action = 'login_success' ORDER BY l.id DESC LIMIT ? OFFSET ?";
+        . " FROM auth_log l WHERE l.action = 'login_success' ORDER BY l.id DESC";
+    if (!$isPrintLogs) {
+        $sql .= ' LIMIT ? OFFSET ?';
+    }
     $stmt = $conn->prepare($sql);
-    $stmt->bind_param('ii', $authSessionsPerPage, $authSessionsOffset);
+    if (!$isPrintLogs) {
+        $stmt->bind_param('ii', $authSessionsPerPage, $authSessionsOffset);
+    }
     $stmt->execute();
     $authSessions = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
@@ -690,6 +767,12 @@ if ($authLogAvailable) {
         }
     }
     unset($row);
+}
+
+$authLoginSuccessTotal = $authSessionsTotal;
+if ($authLogAvailable) {
+    $countResult = mysqli_query($conn, "SELECT COUNT(*) AS total FROM auth_log WHERE action = 'login_failed'");
+    $authLoginFailedTotal = (int) mysqli_fetch_assoc($countResult)['total'];
 }
 
 $rfidUidByUserId = [];
@@ -1690,6 +1773,120 @@ tbody tr:last-child td { border-bottom: none; }
     border-color: rgba(200, 169, 110, 0.55);
 }
 
+.print-only {
+    display: none;
+}
+
+.print-report-header {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    margin-bottom: 12px;
+}
+
+.print-report-brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.print-report-logo {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: rgba(200, 169, 110, 0.12);
+    border: 1px solid var(--glass-border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.print-report-logo img {
+    width: 22px;
+    height: auto;
+}
+
+.print-report-title {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 1.45rem;
+    color: var(--gold-light);
+    line-height: 1.1;
+}
+
+.print-report-meta {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+.print-report-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-size: 0.78rem;
+    color: var(--text-sub);
+}
+
+.print-report-summary {
+    display: grid;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.print-summary-group {
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
+    padding: 12px;
+    background: var(--glass-bg);
+}
+
+.print-summary-title {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+}
+
+.print-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+}
+
+.print-summary-card {
+    border: 1px solid var(--glass-border);
+    border-radius: 10px;
+    padding: 10px;
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.print-summary-label {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+}
+
+.print-summary-value {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 1.25rem;
+    color: var(--gold-light);
+}
+
+.print-mode .print-only {
+    display: block;
+}
+
+.print-mode .table-pagination {
+    display: none;
+}
+
 /* ═══════════════════════════════════════════
    RESPONSIVE
 ═══════════════════════════════════════════ */
@@ -1766,6 +1963,38 @@ tbody tr:last-child td { border-bottom: none; }
         padding: 8px 10px;
         margin-bottom: 10px;
     }
+    .print-only {
+        display: block !important;
+    }
+    .print-report-header {
+        border: 1px solid #ccc;
+        background: none;
+    }
+    .print-report-logo {
+        background: #f5f5f5;
+        border-color: #ccc;
+    }
+    .print-report-title {
+        color: #111;
+    }
+    .print-report-meta,
+    .print-report-meta-row {
+        color: #444;
+    }
+    .print-summary-group {
+        border-color: #ccc;
+        background: #f9f9f9;
+    }
+    .print-summary-card {
+        border-color: #ccc;
+        background: #fff;
+    }
+    .print-summary-label {
+        color: #555;
+    }
+    .print-summary-value {
+        color: #111;
+    }
     .table-scroll {
         overflow: visible;
     }
@@ -1811,7 +2040,7 @@ tbody tr:last-child td { border-bottom: none; }
 }
 </style>
 </head>
-<body>
+<body class="<?= $isPrintLogs ? 'print-mode' : '' ?>">
 
 <!-- ── Background ── -->
 <div class="bg-layer"></div>
@@ -2179,8 +2408,61 @@ tbody tr:last-child td { border-bottom: none; }
         <section id="logs" class="section <?= $initialTab === 'logs' ? 'active' : '' ?>">
             <div class="section-title">Login &amp; Attendance Logs</div>
 
-            <div class="welcome-box" style="margin-bottom:14px;">
+            <div class="welcome-box no-print" style="margin-bottom:14px;">
                 Review RFID attendance activity and web login/logout history, including failed login attempts.
+            </div>
+
+            <div class="print-report-header print-only">
+                <div class="print-report-brand">
+                    <div class="print-report-logo">
+                        <img src="logo.png" alt="SCC Logo">
+                    </div>
+                    <div>
+                        <div class="print-report-title">Logs Report</div>
+                        <div class="print-report-meta">Generated <?= htmlspecialchars($reportGeneratedAt) ?></div>
+                    </div>
+                </div>
+                <div class="print-report-meta-row">
+                    <div>Prepared by: <?= htmlspecialchars($reportPreparedBy) ?> (<?= htmlspecialchars($reportPreparedRole) ?>)</div>
+                    <div>Filters: <?= htmlspecialchars($reportFiltersLabel) ?></div>
+                </div>
+            </div>
+
+            <div class="print-report-summary print-only">
+                <div class="print-summary-group">
+                    <div class="print-summary-title">Attendance Summary</div>
+                    <div class="print-summary-grid">
+                        <div class="print-summary-card">
+                            <div class="print-summary-label">Events</div>
+                            <div class="print-summary-value"><?= (int) $attendanceEventsTotal ?></div>
+                        </div>
+                        <div class="print-summary-card">
+                            <div class="print-summary-label">Time In</div>
+                            <div class="print-summary-value"><?= (int) $attendanceTimeInTotal ?></div>
+                        </div>
+                        <div class="print-summary-card">
+                            <div class="print-summary-label">Time Out</div>
+                            <div class="print-summary-value"><?= (int) $attendanceTimeOutTotal ?></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="print-summary-group">
+                    <div class="print-summary-title">Login Summary</div>
+                    <div class="print-summary-grid">
+                        <div class="print-summary-card">
+                            <div class="print-summary-label">Events</div>
+                            <div class="print-summary-value"><?= (int) $authEventsTotal ?></div>
+                        </div>
+                        <div class="print-summary-card">
+                            <div class="print-summary-label">Login Success</div>
+                            <div class="print-summary-value"><?= (int) $authLoginSuccessTotal ?></div>
+                        </div>
+                        <div class="print-summary-card">
+                            <div class="print-summary-label">Login Failed</div>
+                            <div class="print-summary-value"><?= (int) $authLoginFailedTotal ?></div>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <div class="rfid-actions-grid no-print" style="margin-bottom:14px;">
@@ -2810,6 +3092,24 @@ const btnResetOfflineSessions = document.getElementById('btnResetOfflineSessions
 const rfidResetUid = document.getElementById('rfidResetUid');
 const btnPrintLogs = document.getElementById('btnPrintLogs');
 
+const urlParams = new URLSearchParams(window.location.search);
+const isLogPrintView = urlParams.get('print') === 'logs';
+const shouldAutoPrint = isLogPrintView && urlParams.get('autoprint') === '1';
+const buildLogsUrlWithoutPrint = () => {
+    const params = new URLSearchParams(window.location.search);
+    params.set('tab', 'logs');
+    params.delete('print');
+    params.delete('autoprint');
+    const query = params.toString();
+    return window.location.pathname + (query ? ('?' + query) : '');
+};
+if (shouldAutoPrint) {
+    window.addEventListener('afterprint', () => {
+        window.location.href = buildLogsUrlWithoutPrint();
+    });
+    window.addEventListener('load', () => window.print());
+}
+
 function showRfidMessage(type, text) {
     if (!rfidOpsMessage) return;
     rfidOpsMessage.className = 'rfid-ops-message ' + type;
@@ -2902,7 +3202,29 @@ if (btnResetOfflineSessions) {
 }
 
 if (btnPrintLogs) {
-    btnPrintLogs.addEventListener('click', () => window.print());
+    btnPrintLogs.addEventListener('click', () => {
+        if (isLogPrintView) {
+            window.print();
+            return;
+        }
+
+        const params = new URLSearchParams(window.location.search);
+        params.set('tab', 'logs');
+        params.set('print', 'logs');
+        params.set('autoprint', '1');
+        params.delete('export');
+        params.delete('attPage');
+        params.delete('attSessionPage');
+        params.delete('authPage');
+        params.delete('authSessionPage');
+
+        const query = params.toString();
+        const printUrl = window.location.pathname + (query ? ('?' + query) : '');
+        const popup = window.open(printUrl, '_blank');
+        if (!popup) {
+            window.location.href = printUrl;
+        }
+    });
 }
 
 /* ── Mobile sidebar ── */
