@@ -18,6 +18,13 @@ if (session_status() === PHP_SESSION_NONE) {
 
 require_once __DIR__ . '/system_hours.php';
 
+if (defined('LIBRARY_HOURS_TIMEZONE')) {
+    $currentTz = date_default_timezone_get();
+    if ($currentTz !== LIBRARY_HOURS_TIMEZONE) {
+        date_default_timezone_set(LIBRARY_HOURS_TIMEZONE);
+    }
+}
+
 // Roles
 define('ROLE_ADMIN',   'admin');
 define('ROLE_STUDENT', 'student');

@@ -134,11 +134,11 @@ $reportFiltersLabel = 'All records';
 
 $rfidPortalUrl = getenv('RFID_PORTAL_URL');
 if ($rfidPortalUrl === false || trim($rfidPortalUrl) === '') {
-    $rfidPortalUrl = 'http://10.147.237.184/';
+    $rfidPortalUrl = 'http://10.197.146.184/';
 }
 $rfidPortalUrl = rtrim((string) $rfidPortalUrl, '/') . '/';
 if (!filter_var($rfidPortalUrl, FILTER_VALIDATE_URL)) {
-    $rfidPortalUrl = 'http://10.147.237.184/';
+    $rfidPortalUrl = 'http://10.197.146.184/';
 }
 
 function adminTableExists(mysqli $conn, string $table): bool
@@ -494,27 +494,26 @@ function adminExportAuthSessions(mysqli $conn): void
 
     $lastActivitySql = "SELECT MAX(l2.created_at) FROM auth_log l2"
         . " WHERE l2.session_id = l.session_id AND l2.action IN ('login_success', 'logout', 'heartbeat')";
+    $idleSecondsSql = "TIMESTAMPDIFF(SECOND, ({$lastActivitySql}), NOW())";
     $sql = "SELECT l.username, l.role, l.identity, l.session_id, l.ip_address, l.user_agent, l.created_at AS login_at,"
         . " (SELECT l2.created_at FROM auth_log l2 WHERE l2.action = 'logout' AND l2.id > l.id AND l2.session_id = l.session_id ORDER BY l2.id ASC LIMIT 1) AS logout_at,"
-        . " ({$lastActivitySql}) AS last_activity_at"
+        . " ({$lastActivitySql}) AS last_activity_at,"
+        . " ({$idleSecondsSql}) AS idle_seconds"
         . " FROM auth_log l WHERE l.action = 'login_success' ORDER BY l.id DESC";
     $stmt = $conn->prepare($sql);
     $stmt->execute();
     $result = $stmt->get_result();
 
-    $inactiveCutoff = time() - AUTH_SESSION_INACTIVE_SECONDS;
-    adminSendCsv('auth_sessions.csv', ['Login', 'Logout', 'Duration', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function ($output) use ($result, $inactiveCutoff) {
+    $inactiveSeconds = AUTH_SESSION_INACTIVE_SECONDS;
+    adminSendCsv('auth_sessions.csv', ['Login', 'Logout', 'Duration', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function ($output) use ($result, $inactiveSeconds) {
         while ($row = $result->fetch_assoc()) {
             $startStamp = strtotime((string) ($row['login_at'] ?? ''));
             $endStamp = strtotime((string) ($row['logout_at'] ?? ''));
-            $lastActivityStamp = strtotime((string) ($row['last_activity_at'] ?? ''));
-            if ($lastActivityStamp === false) {
-                $lastActivityStamp = $startStamp;
-            }
+            $idleSeconds = (int) ($row['idle_seconds'] ?? 0);
             $durationLabel = 'Active';
             if ($startStamp !== false && $endStamp !== false && $endStamp >= $startStamp) {
                 $durationLabel = adminFormatDuration((int) ($endStamp - $startStamp));
-            } elseif ($lastActivityStamp !== false && $lastActivityStamp <= $inactiveCutoff) {
+            } elseif ($idleSeconds >= $inactiveSeconds) {
                 $durationLabel = 'Inactive';
             }
 
@@ -580,7 +579,7 @@ $authLoginFailedTotal = 0;
 
 $attendanceEvents = [];
 $attendanceEventsTotal = 0;
-$attendanceEventsPerPage = 20;
+$attendanceEventsPerPage = 10;
 $attendanceEventsPage = $isPrintLogs ? 1 : adminClampPage($_GET['attPage'] ?? 1);
 $attendanceEventsTotalPages = 1;
 $attendanceEventsOffset = 0;
@@ -632,7 +631,7 @@ if ($attendanceLogAvailable) {
 
 $attendanceSessions = [];
 $attendanceSessionsTotal = 0;
-$attendanceSessionsPerPage = 15;
+$attendanceSessionsPerPage = 10;
 $attendanceSessionsPage = $isPrintLogs ? 1 : adminClampPage($_GET['attSessionPage'] ?? 1);
 $attendanceSessionsTotalPages = 1;
 $attendanceSessionsOffset = 0;
@@ -722,7 +721,7 @@ if ($attendanceLogAvailable) {
 $authLogAvailable = adminTableExists($conn, 'auth_log');
 $authEvents = [];
 $authEventsTotal = 0;
-$authEventsPerPage = 20;
+$authEventsPerPage = 10;
 $authEventsPage = $isPrintLogs ? 1 : adminClampPage($_GET['authPage'] ?? 1);
 $authEventsTotalPages = 1;
 $authEventsOffset = 0;
@@ -759,7 +758,7 @@ if ($authLogAvailable) {
 
 $authSessions = [];
 $authSessionsTotal = 0;
-$authSessionsPerPage = 15;
+$authSessionsPerPage = 10;
 $authSessionsPage = $isPrintLogs ? 1 : adminClampPage($_GET['authSessionPage'] ?? 1);
 $authSessionsTotalPages = 1;
 $authSessionsOffset = 0;
@@ -783,9 +782,11 @@ if ($authLogAvailable) {
     $matchCondition = 'l2.session_id = l.session_id';
     $lastActivitySql = "SELECT MAX(l2.created_at) FROM auth_log l2"
         . " WHERE l2.session_id = l.session_id AND l2.action IN ('login_success', 'logout', 'heartbeat')";
+    $idleSecondsSql = "TIMESTAMPDIFF(SECOND, ({$lastActivitySql}), NOW())";
     $sql = "SELECT l.id AS login_id, l.user_id, l.username, l.role, l.identity, l.session_id, l.ip_address, l.user_agent, l.created_at AS login_at,"
         . " (SELECT l2.created_at FROM auth_log l2 WHERE l2.action = 'logout' AND l2.id > l.id AND {$matchCondition} ORDER BY l2.id ASC LIMIT 1) AS logout_at,"
-        . " ({$lastActivitySql}) AS last_activity_at"
+        . " ({$lastActivitySql}) AS last_activity_at,"
+        . " ({$idleSecondsSql}) AS idle_seconds"
         . " FROM auth_log l WHERE l.action = 'login_success' ORDER BY l.id DESC";
     if (!$isPrintLogs) {
         $sql .= ' LIMIT ? OFFSET ?';
@@ -798,18 +799,15 @@ if ($authLogAvailable) {
     $authSessions = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
 
-    $inactiveCutoff = time() - AUTH_SESSION_INACTIVE_SECONDS;
+    $inactiveSeconds = AUTH_SESSION_INACTIVE_SECONDS;
     foreach ($authSessions as &$row) {
         $startStamp = strtotime((string) ($row['login_at'] ?? ''));
         $endStamp = strtotime((string) ($row['logout_at'] ?? ''));
-        $lastActivityStamp = strtotime((string) ($row['last_activity_at'] ?? ''));
-        if ($lastActivityStamp === false) {
-            $lastActivityStamp = $startStamp;
-        }
+        $idleSeconds = (int) ($row['idle_seconds'] ?? 0);
 
         if ($startStamp !== false && $endStamp !== false && $endStamp >= $startStamp) {
             $row['duration_label'] = adminFormatDuration((int) ($endStamp - $startStamp));
-        } elseif ($lastActivityStamp !== false && $lastActivityStamp <= $inactiveCutoff) {
+        } elseif ($idleSeconds >= $inactiveSeconds) {
             $row['duration_label'] = 'Inactive';
         } else {
             $row['duration_label'] = 'Active';
