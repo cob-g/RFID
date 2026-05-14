@@ -417,6 +417,19 @@ if (isset($_POST['register'])) {
 
                 $conn->commit();
 
+                $auditDetails = [
+                    'email' => $email,
+                ];
+                if ($isStudent) {
+                    $auditDetails['student_profile'] = [
+                        'student_id' => $studentId,
+                        'course_or_department' => $course,
+                        'year_level' => $yearLevel,
+                        'section' => $section,
+                        'address' => $address,
+                    ];
+                }
+
                 auditLogWrite($conn, [
                     'actor_user_id'  => $newUserId,
                     'actor_username' => $username,
@@ -425,10 +438,7 @@ if (isset($_POST['register'])) {
                     'target_type'    => 'user',
                     'target_id'      => $newUserId,
                     'target_label'   => $username,
-                    'details'        => [
-                        'email'      => $email,
-                        'student_id' => $isStudent ? $studentId : '',
-                    ],
+                    'details'        => $auditDetails,
                     'ip_address'     => $_SERVER['REMOTE_ADDR'] ?? '',
                 ]);
 

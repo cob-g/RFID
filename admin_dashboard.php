@@ -309,6 +309,205 @@ function adminTruncate(string $value, int $limit = 60): string
     return substr($value, 0, max(0, $limit - 1)) . '…';
 }
 
+function adminDecodeAuditDetails(?string $raw): ?array
+{
+    $raw = trim((string) $raw);
+    if ($raw === '') {
+        return null;
+    }
+
+    $first = $raw[0] ?? '';
+    if ($first !== '{' && $first !== '[') {
+        return null;
+    }
+
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded)) {
+        return null;
+    }
+
+    return $decoded;
+}
+
+function adminNormalizeStudentProfile(array $profile): array
+{
+    $fields = [
+        'student_id' => trim((string) ($profile['student_id'] ?? '')),
+        'course_or_department' => trim((string) ($profile['course_or_department'] ?? '')),
+        'year_level' => trim((string) ($profile['year_level'] ?? '')),
+        'section' => trim((string) ($profile['section'] ?? '')),
+        'address' => trim((string) ($profile['address'] ?? '')),
+    ];
+
+    return array_filter($fields, static fn($value) => $value !== '');
+}
+
+function adminMergeStudentProfile(array $primary, array $fallback): array
+{
+    $merged = $fallback;
+    foreach ($primary as $key => $value) {
+        if ($value !== '') {
+            $merged[$key] = $value;
+        }
+    }
+
+    return $merged;
+}
+
+function adminExtractStudentProfileFromDetails(?array $details): array
+{
+    if (!is_array($details)) {
+        return [];
+    }
+
+    $profile = $details['student_profile'] ?? null;
+    if (!is_array($profile)) {
+        $profile = [
+            'student_id' => $details['student_id'] ?? '',
+            'course_or_department' => $details['course_or_department'] ?? '',
+            'year_level' => $details['year_level'] ?? '',
+            'section' => $details['section'] ?? '',
+            'address' => $details['address'] ?? '',
+        ];
+    }
+
+    return adminNormalizeStudentProfile($profile);
+}
+
+function adminAuditDetailLabel(string $key): string
+{
+    $map = [
+        'email' => 'Email',
+        'student_id' => 'Student ID',
+        'course_or_department' => 'Course/Department',
+        'year_level' => 'Year Level',
+        'section' => 'Section',
+        'address' => 'Address',
+        'role_before' => 'Role Before',
+        'role_after' => 'Role After',
+        'changed' => 'Changed',
+    ];
+
+    if (isset($map[$key])) {
+        return $map[$key];
+    }
+
+    $label = str_replace('_', ' ', $key);
+    return ucwords($label);
+}
+
+function adminFormatDetailValue($value): string
+{
+    if (is_array($value)) {
+        $isList = array_keys($value) === range(0, count($value) - 1);
+        if ($isList) {
+            $items = array_map(static fn($item) => adminFormatDetailValue($item), $value);
+            $items = array_filter($items, static fn($item) => $item !== '');
+            return implode(', ', $items);
+        }
+
+        return json_encode($value, JSON_UNESCAPED_SLASHES);
+    }
+
+    if (is_bool($value)) {
+        return $value ? 'true' : 'false';
+    }
+
+    if ($value === null) {
+        return '';
+    }
+
+    return trim((string) $value);
+}
+
+function adminBuildAuditDetailLines(?string $detailsRaw, ?array $profileLookup): array
+{
+    $detailsRaw = trim((string) $detailsRaw);
+    $details = adminDecodeAuditDetails($detailsRaw);
+    $profileFallback = adminNormalizeStudentProfile($profileLookup ?? []);
+    $profileFromDetails = adminExtractStudentProfileFromDetails($details);
+    $profile = adminMergeStudentProfile($profileFromDetails, $profileFallback);
+
+    if (is_array($details)) {
+        unset($details['student_profile']);
+    }
+
+    $lines = [];
+    if (is_array($details)) {
+        foreach ($details as $key => $value) {
+            if ($key === 'student_id' && isset($profile['student_id'])) {
+                continue;
+            }
+            $formatted = adminFormatDetailValue($value);
+            if ($formatted === '') {
+                continue;
+            }
+            $lines[] = [
+                'label' => adminAuditDetailLabel((string) $key),
+                'value' => $formatted,
+            ];
+        }
+    } elseif ($detailsRaw !== '') {
+        $lines[] = [
+            'label' => 'Details',
+            'value' => $detailsRaw,
+        ];
+    }
+
+    foreach ($profile as $key => $value) {
+        $lines[] = [
+            'label' => adminAuditDetailLabel((string) $key),
+            'value' => $value,
+        ];
+    }
+
+    return $lines;
+}
+
+function adminFormatStudentProfileCsv(array $profile): string
+{
+    $profile = adminNormalizeStudentProfile($profile);
+    if ($profile === []) {
+        return '';
+    }
+
+    $parts = [];
+    foreach ($profile as $key => $value) {
+        $parts[] = adminAuditDetailLabel((string) $key) . ': ' . $value;
+    }
+
+    return implode(' | ', $parts);
+}
+
+function adminFetchStudentProfiles(mysqli $conn, array $userIds): array
+{
+    $userIds = array_values(array_unique(array_filter($userIds, static fn($value) => (int) $value > 0)));
+    if ($userIds === [] || !adminTableExists($conn, 'student_profiles')) {
+        return [];
+    }
+
+    $placeholders = implode(', ', array_fill(0, count($userIds), '?'));
+    $types = str_repeat('i', count($userIds));
+    $sql = 'SELECT user_id, student_id, course_or_department, year_level, section, address'
+        . ' FROM student_profiles WHERE user_id IN (' . $placeholders . ')';
+
+    $stmt = $conn->prepare($sql);
+    dbBindParams($stmt, $types, $userIds);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $profiles = [];
+    while ($row = $result->fetch_assoc()) {
+        $userId = (int) ($row['user_id'] ?? 0);
+        if ($userId <= 0) {
+            continue;
+        }
+        $profiles[$userId] = $row;
+    }
+    $stmt->close();
+
+    return $profiles;
+}
+
 function adminNormalizeDateInput(?string $value): ?string
 {
     $value = trim((string) $value);
@@ -912,7 +1111,7 @@ function adminExportComputers(mysqli $conn): void
 function adminExportAuditLog(mysqli $conn, array $filters): void
 {
     if (!adminTableExists($conn, 'audit_log')) {
-        adminSendCsv('audit_log.csv', ['Date Time', 'Action', 'Actor', 'Role', 'Target Type', 'Target', 'Target ID', 'Details', 'IP Address'], static function () {
+        adminSendCsv('audit_log.csv', ['Date Time', 'Action', 'Actor', 'Role', 'Target Type', 'Target', 'Target ID', 'Details', 'Student Profile', 'IP Address'], static function () {
         });
     }
 
@@ -925,6 +1124,41 @@ function adminExportAuditLog(mysqli $conn, array $filters): void
     }
     $sql .= ' ORDER BY id DESC';
 
+    $profileByUserId = [];
+    if (
+        adminTableExists($conn, 'student_profiles')
+        && adminColumnExists($conn, 'audit_log', 'target_id')
+    ) {
+        $idWhere = $where;
+        $idTypes = $types;
+        $idParams = $params;
+
+        $idWhere[] = 'target_id IS NOT NULL';
+        $idWhere[] = 'target_id > 0';
+        if (adminColumnExists($conn, 'audit_log', 'target_type')) {
+            $idWhere[] = "target_type = 'user'";
+        }
+
+        $idSql = 'SELECT DISTINCT target_id FROM audit_log';
+        if ($idWhere !== []) {
+            $idSql .= ' WHERE ' . implode(' AND ', $idWhere);
+        }
+
+        $idStmt = $conn->prepare($idSql);
+        if ($idTypes !== '') {
+            dbBindParams($idStmt, $idTypes, $idParams);
+        }
+        $idStmt->execute();
+        $idResult = $idStmt->get_result();
+        $userIds = [];
+        while ($idRow = $idResult->fetch_assoc()) {
+            $userIds[] = (int) ($idRow['target_id'] ?? 0);
+        }
+        $idStmt->close();
+
+        $profileByUserId = adminFetchStudentProfiles($conn, $userIds);
+    }
+
     $stmt = $conn->prepare($sql);
     if ($types !== '') {
         dbBindParams($stmt, $types, $params);
@@ -932,8 +1166,16 @@ function adminExportAuditLog(mysqli $conn, array $filters): void
     $stmt->execute();
     $result = $stmt->get_result();
 
-    adminSendCsv('audit_log.csv', ['Date Time', 'Action', 'Actor', 'Role', 'Target Type', 'Target', 'Target ID', 'Details', 'IP Address'], static function ($output) use ($result) {
+    adminSendCsv('audit_log.csv', ['Date Time', 'Action', 'Actor', 'Role', 'Target Type', 'Target', 'Target ID', 'Details', 'Student Profile', 'IP Address'], static function ($output) use ($result, $profileByUserId) {
         while ($row = $result->fetch_assoc()) {
+            $detailsRaw = (string) ($row['details'] ?? '');
+            $decoded = adminDecodeAuditDetails($detailsRaw);
+            $profileFromDetails = adminExtractStudentProfileFromDetails($decoded);
+            $targetId = (int) ($row['target_id'] ?? 0);
+            $profileFallback = adminNormalizeStudentProfile($profileByUserId[$targetId] ?? []);
+            $profile = adminMergeStudentProfile($profileFromDetails, $profileFallback);
+            $studentProfileCsv = adminFormatStudentProfileCsv($profile);
+
             fputcsv($output, [
                 adminFormatTimestamp($row['created_at'] ?? ''),
                 (string) ($row['action'] ?? ''),
@@ -942,7 +1184,8 @@ function adminExportAuditLog(mysqli $conn, array $filters): void
                 (string) ($row['target_type'] ?? ''),
                 (string) ($row['target_label'] ?? ''),
                 (string) ($row['target_id'] ?? ''),
-                (string) ($row['details'] ?? ''),
+                $detailsRaw,
+                $studentProfileCsv,
                 (string) ($row['ip_address'] ?? ''),
             ]);
         }
@@ -1487,6 +1730,20 @@ if ($auditLogAvailable) {
     $stmt->execute();
     $auditEvents = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
+}
+
+$auditProfilesByUserId = [];
+if ($auditLogAvailable && $auditEvents !== []) {
+    $auditUserIds = [];
+    foreach ($auditEvents as $row) {
+        $targetType = (string) ($row['target_type'] ?? '');
+        $targetId = (int) ($row['target_id'] ?? 0);
+        if ($targetType === 'user' && $targetId > 0) {
+            $auditUserIds[] = $targetId;
+        }
+    }
+
+    $auditProfilesByUserId = adminFetchStudentProfiles($conn, $auditUserIds);
 }
 
 $rfidUidByUserId = [];
@@ -2115,6 +2372,31 @@ tbody tr:last-child td { border-bottom: none; }
     margin-top: 4px;
 }
 
+.audit-details {
+    display: grid;
+    gap: 6px;
+}
+
+.audit-detail-row {
+    display: grid;
+    grid-template-columns: minmax(110px, 140px) 1fr;
+    gap: 8px;
+    align-items: start;
+}
+
+.audit-detail-label {
+    font-size: 0.68rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+.audit-detail-value {
+    color: var(--text-sub);
+    word-break: break-word;
+}
+
 .actions { display: flex; gap: 7px; flex-wrap: wrap; }
 
 .btn-action {
@@ -2676,6 +2958,8 @@ tbody tr:last-child td { border-bottom: none; }
     .table-pagination { padding: 10px 12px 14px; }
     .pagination-controls { width: 100%; justify-content: space-between; margin-left: 0; }
     .pagination-pages { flex: 1; justify-content: center; }
+    .audit-detail-row { grid-template-columns: 1fr; }
+    .audit-detail-label { white-space: normal; }
 }
 
 @media (max-width: 380px) {
@@ -2791,6 +3075,27 @@ tbody tr:last-child td { border-bottom: none; }
         padding: 6px 8px;
         font-size: 9pt;
         word-break: break-word;
+    }
+    .audit-log-table {
+        table-layout: auto;
+    }
+    .audit-details {
+        display: block;
+    }
+    .audit-detail-row {
+        display: block;
+        margin-bottom: 4px;
+    }
+    .audit-detail-label {
+        color: #333;
+        font-weight: 600;
+        font-size: 8pt;
+        display: block;
+        letter-spacing: 0.06em;
+    }
+    .audit-detail-value {
+        color: #111;
+        display: block;
     }
     tbody tr {
         page-break-inside: avoid;
@@ -2964,7 +3269,7 @@ tbody tr:last-child td { border-bottom: none; }
 
             <div class="table-wrap">
                 <div class="table-scroll">
-                    <table>
+                    <table class="audit-log-table">
                         <thead>
                             <tr>
                                 <th>ID</th>
@@ -3891,8 +4196,12 @@ tbody tr:last-child td { border-bottom: none; }
                                     if ($targetLabel === '') {
                                         $targetLabel = '—';
                                     }
-                                    $details = (string) ($row['details'] ?? '');
-                                    $detailsShort = $details !== '' ? adminTruncate($details, 80) : '—';
+                                    $detailsRaw = (string) ($row['details'] ?? '');
+                                    $targetProfileId = (int) ($row['target_id'] ?? 0);
+                                    $detailLines = adminBuildAuditDetailLines(
+                                        $detailsRaw,
+                                        $auditProfilesByUserId[$targetProfileId] ?? null
+                                    );
                                     ?>
                                     <tr>
                                         <td><?= htmlspecialchars(adminFormatTimestamp($row['created_at'] ?? '')) ?></td>
@@ -3914,8 +4223,23 @@ tbody tr:last-child td { border-bottom: none; }
                                             <?php endif; ?>
                                         </td>
                                         <td><?= htmlspecialchars((string) ($row['ip_address'] ?? '—')) ?></td>
-                                        <td title="<?= htmlspecialchars($details) ?>">
-                                            <?= htmlspecialchars($detailsShort) ?>
+                                        <td>
+                                            <?php if ($detailLines === []): ?>
+                                                —
+                                            <?php else: ?>
+                                                <div class="audit-details">
+                                                    <?php foreach ($detailLines as $detail): ?>
+                                                        <div class="audit-detail-row">
+                                                            <span class="audit-detail-label">
+                                                                <?= htmlspecialchars($detail['label']) ?>
+                                                            </span>
+                                                            <span class="audit-detail-value">
+                                                                <?= htmlspecialchars($detail['value']) ?>
+                                                            </span>
+                                                        </div>
+                                                    <?php endforeach; ?>
+                                                </div>
+                                            <?php endif; ?>
                                         </td>
                                     </tr>
                                 <?php endforeach; ?>

@@ -160,6 +160,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
                 $changedFields[] = 'student_profile';
             }
 
+            $auditDetails = [
+                'changed' => $changedFields,
+                'role_before' => $originalRole,
+                'role_after' => $roleInput,
+            ];
+            if ($roleInput === 'student') {
+                $auditDetails['student_profile'] = [
+                    'student_id' => $studentIdInput,
+                    'course_or_department' => $courseInput,
+                    'year_level' => $yearLevelInput,
+                    'section' => $sectionInput,
+                    'address' => $addressInput,
+                ];
+            }
+
             auditLogWrite($conn, [
                 'actor_user_id' => (int) ($_SESSION['user_id'] ?? 0),
                 'actor_username' => (string) ($_SESSION['username'] ?? ''),
@@ -168,11 +183,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
                 'target_type' => 'user',
                 'target_id' => $id,
                 'target_label' => $usernameInput,
-                'details' => [
-                    'changed' => $changedFields,
-                    'role_before' => $originalRole,
-                    'role_after' => $roleInput,
-                ],
+                'details' => $auditDetails,
                 'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
             ]);
 
