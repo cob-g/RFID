@@ -40,9 +40,34 @@ if ($current_role === 'admin' && in_array($target_role, ['admin', 'superadmin'],
 }
 
 $allowedRoles = ['superadmin', 'admin', 'librarian', 'assistant', 'faculty', 'student'];
+
+function studentIdTaken(mysqli $conn, string $studentId, int $currentUserId): bool
+{
+    $studentId = trim($studentId);
+    if ($studentId === '' || !dbTableExists($conn, 'student_profiles')) {
+        return false;
+    }
+
+    $stmt = $conn->prepare(
+        'SELECT user_id FROM student_profiles WHERE student_id = ? AND user_id <> ? LIMIT 1'
+    );
+    $stmt->bind_param('si', $studentId, $currentUserId);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    return (bool) $row;
+}
+
 $formError = '';
 $usernameInput = (string) ($user['username'] ?? '');
 $roleInput = (string) ($user['role'] ?? '');
+$studentProfile = studentProfileFetch($conn, $id);
+$studentIdInput = (string) ($studentProfile['student_id'] ?? '');
+$courseInput = (string) ($studentProfile['course_or_department'] ?? '');
+$yearLevelInput = (string) ($studentProfile['year_level'] ?? '');
+$sectionInput = (string) ($studentProfile['section'] ?? '');
+$addressInput = (string) ($studentProfile['address'] ?? '');
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
     $csrf = (string) ($_POST['csrf'] ?? '');
@@ -53,6 +78,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
     $usernameInput = trim((string) ($_POST['username'] ?? ''));
     $roleInput = trim((string) ($_POST['role'] ?? ''));
     $password = (string) ($_POST['password'] ?? '');
+    $studentIdInput = trim((string) ($_POST['student_id'] ?? $studentIdInput));
+    $courseInput = trim((string) ($_POST['course_or_department'] ?? $courseInput));
+    $yearLevelInput = trim((string) ($_POST['year_level'] ?? $yearLevelInput));
+    $sectionInput = trim((string) ($_POST['section'] ?? $sectionInput));
+    $addressInput = trim((string) ($_POST['address'] ?? $addressInput));
 
     if ($formError === '' && $usernameInput === '') {
         $formError = 'Username is required.';
@@ -66,26 +96,95 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
         $formError = 'You cannot assign this role.';
     }
 
+    if ($formError === '' && $roleInput === 'student') {
+        if ($studentIdInput === '' || $courseInput === '' || $yearLevelInput === '' || $sectionInput === '' || $addressInput === '') {
+            $formError = 'Please complete all student profile fields.';
+        } elseif (studentIdTaken($conn, $studentIdInput, $id)) {
+            $formError = 'Student ID is already assigned to another user.';
+        }
+    }
+
     if ($formError === '') {
-        if ($password !== '') {
-            $password_hash = password_hash($password, PASSWORD_DEFAULT);
-            $stmt = $conn->prepare('UPDATE users SET username = ?, role = ?, password = ? WHERE id = ?');
-            $stmt->bind_param('sssi', $usernameInput, $roleInput, $password_hash, $id);
-        } else {
-            $stmt = $conn->prepare('UPDATE users SET username = ?, role = ? WHERE id = ?');
-            $stmt->bind_param('ssi', $usernameInput, $roleInput, $id);
+        $originalUsername = (string) ($user['username'] ?? '');
+        $originalRole = (string) ($user['role'] ?? '');
+        $profileChanged = false;
+
+        if ($roleInput === 'student') {
+            $profileChanged = (
+                $studentIdInput !== (string) ($studentProfile['student_id'] ?? '')
+                || $courseInput !== (string) ($studentProfile['course_or_department'] ?? '')
+                || $yearLevelInput !== (string) ($studentProfile['year_level'] ?? '')
+                || $sectionInput !== (string) ($studentProfile['section'] ?? '')
+                || $addressInput !== (string) ($studentProfile['address'] ?? '')
+            );
         }
 
-        if ($stmt->execute()) {
+        try {
+            $conn->begin_transaction();
+
+            if ($password !== '') {
+                $password_hash = password_hash($password, PASSWORD_DEFAULT);
+                $stmt = $conn->prepare('UPDATE users SET username = ?, role = ?, password = ? WHERE id = ?');
+                $stmt->bind_param('sssi', $usernameInput, $roleInput, $password_hash, $id);
+            } else {
+                $stmt = $conn->prepare('UPDATE users SET username = ?, role = ? WHERE id = ?');
+                $stmt->bind_param('ssi', $usernameInput, $roleInput, $id);
+            }
+
+            $stmt->execute();
+            $stmt->close();
+
+            if ($roleInput === 'student') {
+                studentProfileUpsert($conn, $id, [
+                    'student_id' => $studentIdInput,
+                    'course_or_department' => $courseInput,
+                    'year_level' => $yearLevelInput,
+                    'section' => $sectionInput,
+                    'address' => $addressInput,
+                ]);
+            }
+
+            $conn->commit();
+
+            $changedFields = [];
+            if ($usernameInput !== $originalUsername) {
+                $changedFields[] = 'username';
+            }
+            if ($roleInput !== $originalRole) {
+                $changedFields[] = 'role';
+            }
+            if ($password !== '') {
+                $changedFields[] = 'password';
+            }
+            if ($profileChanged) {
+                $changedFields[] = 'student_profile';
+            }
+
+            auditLogWrite($conn, [
+                'actor_user_id' => (int) ($_SESSION['user_id'] ?? 0),
+                'actor_username' => (string) ($_SESSION['username'] ?? ''),
+                'actor_role' => (string) ($_SESSION['role'] ?? ''),
+                'action' => 'user_update',
+                'target_type' => 'user',
+                'target_id' => $id,
+                'target_label' => $usernameInput,
+                'details' => [
+                    'changed' => $changedFields,
+                    'role_before' => $originalRole,
+                    'role_after' => $roleInput,
+                ],
+                'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
+            ]);
+
             $_SESSION['success'] = 'User updated successfully.';
             $_SESSION['redirect_to_users'] = true;
-            $stmt->close();
             header('Location: admin_dashboard.php?tab=users');
             exit;
+        } catch (Throwable $e) {
+            $conn->rollback();
+            error_log('[edit_user] Update failed: ' . $e->getMessage());
+            $formError = 'Error updating user.';
         }
-
-        $stmt->close();
-        $formError = 'Error updating user.';
     }
 }
 ?>
@@ -522,6 +621,24 @@ body {
     color: var(--text-main);
 }
 
+.field-group-label {
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin: 6px 0 4px;
+}
+
+.student-fields {
+    display: none;
+    gap: 14px;
+}
+
+.student-fields.active {
+    display: grid;
+}
+
 .inline-note {
     margin-top: 6px;
     font-size: 0.78rem;
@@ -749,6 +866,65 @@ body {
                                 <div class="inline-note">Choose the access level this user should have.</div>
                             </div>
 
+                            <div id="studentFields" class="student-fields">
+                                <div class="field-group-label">Student Profile</div>
+
+                                <div class="field">
+                                    <label for="student_id">Student ID</label>
+                                    <input
+                                        type="text"
+                                        id="student_id"
+                                        name="student_id"
+                                        value="<?= htmlspecialchars($studentIdInput) ?>"
+                                        maxlength="40"
+                                    >
+                                </div>
+
+                                <div class="field">
+                                    <label for="course_or_department">Course / Department</label>
+                                    <input
+                                        type="text"
+                                        id="course_or_department"
+                                        name="course_or_department"
+                                        value="<?= htmlspecialchars($courseInput) ?>"
+                                        maxlength="120"
+                                    >
+                                </div>
+
+                                <div class="field">
+                                    <label for="year_level">Year Level</label>
+                                    <input
+                                        type="text"
+                                        id="year_level"
+                                        name="year_level"
+                                        value="<?= htmlspecialchars($yearLevelInput) ?>"
+                                        maxlength="30"
+                                    >
+                                </div>
+
+                                <div class="field">
+                                    <label for="section">Section</label>
+                                    <input
+                                        type="text"
+                                        id="section"
+                                        name="section"
+                                        value="<?= htmlspecialchars($sectionInput) ?>"
+                                        maxlength="30"
+                                    >
+                                </div>
+
+                                <div class="field">
+                                    <label for="address">Address</label>
+                                    <input
+                                        type="text"
+                                        id="address"
+                                        name="address"
+                                        value="<?= htmlspecialchars($addressInput) ?>"
+                                        maxlength="255"
+                                    >
+                                </div>
+                            </div>
+
                             <div class="field">
                                 <label for="password">New Password</label>
                                 <div class="password-row">
@@ -809,6 +985,8 @@ document.addEventListener('keydown', event => {
 
 const passwordInput = document.getElementById('password');
 const togglePassword = document.getElementById('togglePassword');
+const roleSelect = document.getElementById('role');
+const studentFields = document.getElementById('studentFields');
 
 if (togglePassword && passwordInput) {
     togglePassword.addEventListener('click', () => {
@@ -817,6 +995,21 @@ if (togglePassword && passwordInput) {
         togglePassword.textContent = hidden ? 'Hide' : 'Show';
     });
 }
+
+function toggleStudentFields() {
+    if (!roleSelect || !studentFields) return;
+    const isStudent = roleSelect.value === 'student';
+    studentFields.classList.toggle('active', isStudent);
+    const inputs = studentFields.querySelectorAll('input');
+    inputs.forEach(input => {
+        input.required = isStudent;
+    });
+}
+
+if (roleSelect) {
+    roleSelect.addEventListener('change', toggleStudentFields);
+}
+toggleStudentFields();
 </script>
 
 </body>

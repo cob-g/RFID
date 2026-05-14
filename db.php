@@ -234,3 +234,135 @@ function authLogHeartbeatIfNeeded(mysqli $conn, int $intervalSeconds = 60): void
 if ($conn instanceof mysqli) {
     authLogHeartbeatIfNeeded($conn);
 }
+
+function auditLogWrite(mysqli $conn, array $payload): void
+{
+    $action = trim((string) ($payload['action'] ?? ''));
+    if ($action === '' || !dbTableExists($conn, 'audit_log')) {
+        return;
+    }
+    if (!dbColumnExists($conn, 'audit_log', 'action')) {
+        return;
+    }
+
+    $actorUsername = trim((string) ($payload['actor_username'] ?? ''));
+    $actorRole = trim((string) ($payload['actor_role'] ?? ''));
+    $targetType = trim((string) ($payload['target_type'] ?? ''));
+    $targetLabel = trim((string) ($payload['target_label'] ?? ''));
+    $ipAddress = trim((string) ($payload['ip_address'] ?? ''));
+
+    $details = $payload['details'] ?? '';
+    if (is_array($details)) {
+        $details = json_encode($details, JSON_UNESCAPED_SLASHES);
+    }
+    $details = trim((string) $details);
+
+    $actorUserId = $payload['actor_user_id'] ?? null;
+    if (!is_int($actorUserId)) {
+        $actorUserId = is_numeric($actorUserId) ? (int) $actorUserId : null;
+    }
+
+    $targetId = $payload['target_id'] ?? null;
+    if (!is_int($targetId)) {
+        $targetId = is_numeric($targetId) ? (int) $targetId : null;
+    }
+
+    $columns = [];
+    $types = '';
+    $values = [];
+
+    if ($actorUserId !== null && dbColumnExists($conn, 'audit_log', 'actor_user_id')) {
+        $columns[] = 'actor_user_id';
+        $types .= 'i';
+        $values[] = $actorUserId;
+    }
+
+    if ($targetId !== null && dbColumnExists($conn, 'audit_log', 'target_id')) {
+        $columns[] = 'target_id';
+        $types .= 'i';
+        $values[] = $targetId;
+    }
+
+    $stringValues = [
+        'actor_username' => [$actorUsername, 80],
+        'actor_role' => [$actorRole, 30],
+        'action' => [$action, 50],
+        'target_type' => [$targetType, 40],
+        'target_label' => [$targetLabel, 120],
+        'details' => [$details, 2000],
+        'ip_address' => [$ipAddress, 45],
+    ];
+
+    foreach ($stringValues as $column => [$value, $limit]) {
+        if (!dbColumnExists($conn, 'audit_log', $column)) {
+            continue;
+        }
+        if ($value === '') {
+            continue;
+        }
+        $columns[] = $column;
+        $types .= 's';
+        $values[] = substr($value, 0, $limit);
+    }
+
+    if ($columns === []) {
+        return;
+    }
+
+    $placeholders = implode(', ', array_fill(0, count($columns), '?'));
+    $sql = 'INSERT INTO audit_log (' . implode(', ', $columns) . ') VALUES (' . $placeholders . ')';
+
+    try {
+        $stmt = $conn->prepare($sql);
+        dbBindParams($stmt, $types, $values);
+        $stmt->execute();
+        $stmt->close();
+    } catch (Throwable $e) {
+        error_log('[audit_log] Insert failed: ' . $e->getMessage());
+    }
+}
+
+function studentProfileFetch(mysqli $conn, int $userId): ?array
+{
+    if ($userId <= 0 || !dbTableExists($conn, 'student_profiles')) {
+        return null;
+    }
+
+    $stmt = $conn->prepare(
+        'SELECT user_id, student_id, course_or_department, year_level, section, address'
+        . ' FROM student_profiles WHERE user_id = ? LIMIT 1'
+    );
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    return $row ?: null;
+}
+
+function studentProfileUpsert(mysqli $conn, int $userId, array $profile): void
+{
+    if ($userId <= 0 || !dbTableExists($conn, 'student_profiles')) {
+        return;
+    }
+
+    $studentId = substr(trim((string) ($profile['student_id'] ?? '')), 0, 40);
+    $course = substr(trim((string) ($profile['course_or_department'] ?? '')), 0, 120);
+    $yearLevel = substr(trim((string) ($profile['year_level'] ?? '')), 0, 30);
+    $section = substr(trim((string) ($profile['section'] ?? '')), 0, 30);
+    $address = substr(trim((string) ($profile['address'] ?? '')), 0, 255);
+
+    $stmt = $conn->prepare(
+        'INSERT INTO student_profiles (user_id, student_id, course_or_department, year_level, section, address)'
+        . ' VALUES (?, ?, ?, ?, ?, ?)' 
+        . ' ON DUPLICATE KEY UPDATE'
+        . ' student_id = VALUES(student_id),'
+        . ' course_or_department = VALUES(course_or_department),'
+        . ' year_level = VALUES(year_level),'
+        . ' section = VALUES(section),'
+        . ' address = VALUES(address)'
+    );
+    $stmt->bind_param('isssss', $userId, $studentId, $course, $yearLevel, $section, $address);
+    $stmt->execute();
+    $stmt->close();
+}

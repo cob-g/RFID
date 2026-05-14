@@ -46,6 +46,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_system_hours']))
 
     try {
         libraryHoursSetConfig($conn, $openTime, $closeTime, $currentUserId > 0 ? $currentUserId : null);
+        auditLogWrite($conn, [
+            'actor_user_id' => (int) ($currentUserId > 0 ? $currentUserId : 0),
+            'actor_username' => (string) ($_SESSION['username'] ?? ''),
+            'actor_role' => (string) ($_SESSION['role'] ?? ''),
+            'action' => 'system_hours_update',
+            'target_type' => 'system_hours',
+            'target_id' => 1,
+            'target_label' => 'system_hours',
+            'details' => [
+                'open_time' => $openTime,
+                'close_time' => $closeTime,
+            ],
+            'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
+        ]);
         $_SESSION['success'] = 'System hours updated successfully.';
     } catch (InvalidArgumentException $e) {
         $_SESSION['error'] = $e->getMessage();
@@ -295,6 +309,252 @@ function adminTruncate(string $value, int $limit = 60): string
     return substr($value, 0, max(0, $limit - 1)) . '…';
 }
 
+function adminNormalizeDateInput(?string $value): ?string
+{
+    $value = trim((string) $value);
+    if ($value === '') {
+        return null;
+    }
+
+    $dt = DateTimeImmutable::createFromFormat('!Y-m-d', $value);
+    $errors = DateTimeImmutable::getLastErrors();
+    $hasErrors = is_array($errors)
+        ? (($errors['warning_count'] ?? 0) > 0 || ($errors['error_count'] ?? 0) > 0)
+        : false;
+
+    if (!$dt instanceof DateTimeImmutable || $hasErrors) {
+        return null;
+    }
+
+    return $dt->format('Y-m-d');
+}
+
+function adminNormalizeDateRange(?string $fromRaw, ?string $toRaw): array
+{
+    $from = adminNormalizeDateInput($fromRaw);
+    $to = adminNormalizeDateInput($toRaw);
+
+    $fromStamp = $from !== null ? ($from . ' 00:00:00') : null;
+    $toStamp = $to !== null ? ($to . ' 23:59:59') : null;
+
+    return [$fromStamp, $toStamp];
+}
+
+function adminFiltersActive(array $filters, array $keys): bool
+{
+    foreach ($keys as $key) {
+        if (!empty($filters[$key])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function adminParseAttendanceFilters(): array
+{
+    [$fromStamp, $toStamp] = adminNormalizeDateRange($_GET['att_from'] ?? '', $_GET['att_to'] ?? '');
+    $action = strtoupper(trim((string) ($_GET['att_action'] ?? '')));
+    if (!in_array($action, ['TIME_IN', 'TIME_OUT'], true)) {
+        $action = '';
+    }
+
+    return [
+        'from' => $fromStamp,
+        'to' => $toStamp,
+        'action' => $action,
+        'user' => substr(trim((string) ($_GET['att_user'] ?? '')), 0, 120),
+        'device' => substr(trim((string) ($_GET['att_device'] ?? '')), 0, 80),
+    ];
+}
+
+function adminParseAuthFilters(): array
+{
+    [$fromStamp, $toStamp] = adminNormalizeDateRange($_GET['auth_from'] ?? '', $_GET['auth_to'] ?? '');
+    $action = trim((string) ($_GET['auth_action'] ?? ''));
+    if (!in_array($action, ['login_success', 'login_failed', 'logout'], true)) {
+        $action = '';
+    }
+
+    return [
+        'from' => $fromStamp,
+        'to' => $toStamp,
+        'action' => $action,
+        'user' => substr(trim((string) ($_GET['auth_user'] ?? '')), 0, 120),
+        'ip' => substr(trim((string) ($_GET['auth_ip'] ?? '')), 0, 45),
+    ];
+}
+
+function adminParseAuditFilters(): array
+{
+    [$fromStamp, $toStamp] = adminNormalizeDateRange($_GET['audit_from'] ?? '', $_GET['audit_to'] ?? '');
+    return [
+        'from' => $fromStamp,
+        'to' => $toStamp,
+        'action' => substr(trim((string) ($_GET['audit_action'] ?? '')), 0, 50),
+        'actor' => substr(trim((string) ($_GET['audit_actor'] ?? '')), 0, 120),
+        'target' => substr(trim((string) ($_GET['audit_target'] ?? '')), 0, 120),
+        'ip' => substr(trim((string) ($_GET['audit_ip'] ?? '')), 0, 45),
+    ];
+}
+
+function adminApplyDateRange(array &$where, string &$types, array &$params, string $column, ?string $from, ?string $to): void
+{
+    if ($from !== null) {
+        $where[] = $column . ' >= ?';
+        $types .= 's';
+        $params[] = $from;
+    }
+    if ($to !== null) {
+        $where[] = $column . ' <= ?';
+        $types .= 's';
+        $params[] = $to;
+    }
+}
+
+function adminBuildAttendanceWhere(array $filters, bool $hasUserId, bool $hasDevice, bool $includeAction): array
+{
+    $where = [];
+    $types = '';
+    $params = [];
+
+    adminApplyDateRange($where, $types, $params, 'a.created_at', $filters['from'] ?? null, $filters['to'] ?? null);
+
+    if ($includeAction && !empty($filters['action'])) {
+        $where[] = 'a.action = ?';
+        $types .= 's';
+        $params[] = $filters['action'];
+    }
+
+    $userTerm = trim((string) ($filters['user'] ?? ''));
+    if ($userTerm !== '') {
+        $like = '%' . $userTerm . '%';
+        $userConditions = ['a.name LIKE ?', 'a.uid LIKE ?'];
+        $types .= 'ss';
+        $params[] = $like;
+        $params[] = $like;
+
+        if ($hasUserId) {
+            $userConditions[] = 'u.username LIKE ?';
+            $userConditions[] = 'u.email LIKE ?';
+            $types .= 'ss';
+            $params[] = $like;
+            $params[] = $like;
+        }
+
+        $where[] = '(' . implode(' OR ', $userConditions) . ')';
+    }
+
+    $deviceTerm = trim((string) ($filters['device'] ?? ''));
+    if ($deviceTerm !== '' && $hasDevice) {
+        $where[] = 'a.device LIKE ?';
+        $types .= 's';
+        $params[] = '%' . $deviceTerm . '%';
+    }
+
+    return [$where, $types, $params];
+}
+
+function adminBuildAuthWhere(array $filters, bool $includeAction): array
+{
+    $where = [];
+    $types = '';
+    $params = [];
+
+    adminApplyDateRange($where, $types, $params, 'l.created_at', $filters['from'] ?? null, $filters['to'] ?? null);
+
+    if ($includeAction && !empty($filters['action'])) {
+        $where[] = 'l.action = ?';
+        $types .= 's';
+        $params[] = $filters['action'];
+    }
+
+    $userTerm = trim((string) ($filters['user'] ?? ''));
+    if ($userTerm !== '') {
+        $like = '%' . $userTerm . '%';
+        $where[] = '(l.username LIKE ? OR l.identity LIKE ?)';
+        $types .= 'ss';
+        $params[] = $like;
+        $params[] = $like;
+    }
+
+    $ipTerm = trim((string) ($filters['ip'] ?? ''));
+    if ($ipTerm !== '') {
+        $where[] = 'l.ip_address LIKE ?';
+        $types .= 's';
+        $params[] = '%' . $ipTerm . '%';
+    }
+
+    return [$where, $types, $params];
+}
+
+function adminBuildAuditWhere(array $filters): array
+{
+    $where = [];
+    $types = '';
+    $params = [];
+
+    adminApplyDateRange($where, $types, $params, 'created_at', $filters['from'] ?? null, $filters['to'] ?? null);
+
+    $action = trim((string) ($filters['action'] ?? ''));
+    if ($action !== '') {
+        $where[] = 'action = ?';
+        $types .= 's';
+        $params[] = $action;
+    }
+
+    $actor = trim((string) ($filters['actor'] ?? ''));
+    if ($actor !== '') {
+        $like = '%' . $actor . '%';
+        $where[] = '(actor_username LIKE ? OR actor_role LIKE ?)';
+        $types .= 'ss';
+        $params[] = $like;
+        $params[] = $like;
+    }
+
+    $target = trim((string) ($filters['target'] ?? ''));
+    if ($target !== '') {
+        $like = '%' . $target . '%';
+        if (is_numeric($target)) {
+            $where[] = '(target_id = ? OR target_label LIKE ?)';
+            $types .= 'is';
+            $params[] = (int) $target;
+            $params[] = $like;
+        } else {
+            $where[] = '(target_label LIKE ? OR target_type LIKE ?)';
+            $types .= 'ss';
+            $params[] = $like;
+            $params[] = $like;
+        }
+    }
+
+    $ipTerm = trim((string) ($filters['ip'] ?? ''));
+    if ($ipTerm !== '') {
+        $where[] = 'ip_address LIKE ?';
+        $types .= 's';
+        $params[] = '%' . $ipTerm . '%';
+    }
+
+    return [$where, $types, $params];
+}
+
+function adminBuildLogFiltersLabel(array $attendanceFilters, array $authFilters, array $auditFilters): string
+{
+    $labels = [];
+
+    if (adminFiltersActive($attendanceFilters, ['from', 'to', 'action', 'user', 'device'])) {
+        $labels[] = 'Attendance filters applied';
+    }
+    if (adminFiltersActive($authFilters, ['from', 'to', 'action', 'user', 'ip'])) {
+        $labels[] = 'Auth filters applied';
+    }
+    if (adminFiltersActive($auditFilters, ['from', 'to', 'action', 'actor', 'target', 'ip'])) {
+        $labels[] = 'Audit filters applied';
+    }
+
+    return $labels === [] ? 'All records' : implode(' | ', $labels);
+}
+
 function adminSendCsv(string $filename, array $headers, callable $writer): void
 {
     header('Content-Type: text/csv; charset=UTF-8');
@@ -309,7 +569,7 @@ function adminSendCsv(string $filename, array $headers, callable $writer): void
     exit;
 }
 
-function adminExportAttendanceEvents(mysqli $conn): void
+function adminExportAttendanceEvents(mysqli $conn, array $filters): void
 {
     if (!adminTableExists($conn, 'attendance')) {
         adminSendCsv('attendance_events.csv', ['Date Time', 'Action', 'User', 'Role', 'UID', 'Device'], static function () {
@@ -318,7 +578,9 @@ function adminExportAttendanceEvents(mysqli $conn): void
 
     $hasUserId = adminColumnExists($conn, 'attendance', 'user_id');
     $hasDevice = adminColumnExists($conn, 'attendance', 'device');
-    $columns = ['a.name', 'a.uid', 'a.date', 'a.time', 'a.action'];
+    [$where, $types, $params] = adminBuildAttendanceWhere($filters, $hasUserId, $hasDevice, true);
+
+    $columns = ['a.name', 'a.uid', 'a.date', 'a.time', 'a.action', 'a.created_at'];
     if ($hasDevice) {
         $columns[] = 'a.device';
     }
@@ -332,9 +594,15 @@ function adminExportAttendanceEvents(mysqli $conn): void
     if ($hasUserId) {
         $sql .= ' LEFT JOIN users u ON u.id = a.user_id';
     }
+    if ($where !== []) {
+        $sql .= ' WHERE ' . implode(' AND ', $where);
+    }
     $sql .= ' ORDER BY a.id DESC';
 
     $stmt = $conn->prepare($sql);
+    if ($types !== '') {
+        dbBindParams($stmt, $types, $params);
+    }
     $stmt->execute();
     $result = $stmt->get_result();
 
@@ -364,7 +632,7 @@ function adminExportAttendanceEvents(mysqli $conn): void
     });
 }
 
-function adminExportAttendanceSessions(mysqli $conn): void
+function adminExportAttendanceSessions(mysqli $conn, array $filters): void
 {
     if (!adminTableExists($conn, 'attendance')) {
         adminSendCsv('attendance_sessions.csv', ['Time In', 'Time Out', 'Duration', 'User', 'Role', 'UID', 'Device'], static function () {
@@ -373,6 +641,8 @@ function adminExportAttendanceSessions(mysqli $conn): void
 
     $hasUserId = adminColumnExists($conn, 'attendance', 'user_id');
     $hasDevice = adminColumnExists($conn, 'attendance', 'device');
+    [$where, $types, $params] = adminBuildAttendanceWhere($filters, $hasUserId, $hasDevice, false);
+    $where[] = "a.action = 'TIME_IN'";
 
     $matchCondition = $hasUserId
         ? "((a.user_id IS NOT NULL AND a2.user_id = a.user_id) OR (a.user_id IS NULL AND a2.uid = a.uid))"
@@ -406,9 +676,15 @@ function adminExportAttendanceSessions(mysqli $conn): void
     if ($hasUserId) {
         $sql .= ' LEFT JOIN users u ON u.id = a.user_id';
     }
-    $sql .= " WHERE a.action = 'TIME_IN' ORDER BY a.id DESC";
+    if ($where !== []) {
+        $sql .= ' WHERE ' . implode(' AND ', $where);
+    }
+    $sql .= ' ORDER BY a.id DESC';
 
     $stmt = $conn->prepare($sql);
+    if ($types !== '') {
+        dbBindParams($stmt, $types, $params);
+    }
     $stmt->execute();
     $result = $stmt->get_result();
 
@@ -456,16 +732,27 @@ function adminExportAttendanceSessions(mysqli $conn): void
     });
 }
 
-function adminExportAuthEvents(mysqli $conn): void
+function adminExportAuthEvents(mysqli $conn, array $filters): void
 {
     if (!adminTableExists($conn, 'auth_log')) {
         adminSendCsv('auth_events.csv', ['Date Time', 'Action', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function () {
         });
     }
 
-    $sql = "SELECT username, role, identity, action, session_id, ip_address, user_agent, created_at"
-        . " FROM auth_log WHERE action <> 'heartbeat' ORDER BY id DESC";
+    [$where, $types, $params] = adminBuildAuthWhere($filters, true);
+    $where[] = "l.action <> 'heartbeat'";
+
+    $sql = "SELECT l.username, l.role, l.identity, l.action, l.session_id, l.ip_address, l.user_agent, l.created_at"
+        . " FROM auth_log l";
+    if ($where !== []) {
+        $sql .= ' WHERE ' . implode(' AND ', $where);
+    }
+    $sql .= ' ORDER BY l.id DESC';
+
     $stmt = $conn->prepare($sql);
+    if ($types !== '') {
+        dbBindParams($stmt, $types, $params);
+    }
     $stmt->execute();
     $result = $stmt->get_result();
 
@@ -485,12 +772,15 @@ function adminExportAuthEvents(mysqli $conn): void
     });
 }
 
-function adminExportAuthSessions(mysqli $conn): void
+function adminExportAuthSessions(mysqli $conn, array $filters): void
 {
     if (!adminTableExists($conn, 'auth_log')) {
         adminSendCsv('auth_sessions.csv', ['Login', 'Logout', 'Duration', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function () {
         });
     }
+
+    [$where, $types, $params] = adminBuildAuthWhere($filters, false);
+    $where[] = "l.action = 'login_success'";
 
     $lastActivitySql = "SELECT MAX(l2.created_at) FROM auth_log l2"
         . " WHERE l2.session_id = l.session_id AND l2.action IN ('login_success', 'logout', 'heartbeat')";
@@ -499,8 +789,16 @@ function adminExportAuthSessions(mysqli $conn): void
         . " (SELECT l2.created_at FROM auth_log l2 WHERE l2.action = 'logout' AND l2.id > l.id AND l2.session_id = l.session_id ORDER BY l2.id ASC LIMIT 1) AS logout_at,"
         . " ({$lastActivitySql}) AS last_activity_at,"
         . " ({$idleSecondsSql}) AS idle_seconds"
-        . " FROM auth_log l WHERE l.action = 'login_success' ORDER BY l.id DESC";
+        . " FROM auth_log l";
+    if ($where !== []) {
+        $sql .= ' WHERE ' . implode(' AND ', $where);
+    }
+    $sql .= ' ORDER BY l.id DESC';
+
     $stmt = $conn->prepare($sql);
+    if ($types !== '') {
+        dbBindParams($stmt, $types, $params);
+    }
     $stmt->execute();
     $result = $stmt->get_result();
 
@@ -532,20 +830,186 @@ function adminExportAuthSessions(mysqli $conn): void
     });
 }
 
-if (isset($_GET['export'])) {
-    if (!$canViewLogs) {
-        http_response_code(403);
-        exit('Access denied.');
+function adminExportUsers(mysqli $conn): void
+{
+    if (!adminTableExists($conn, 'users')) {
+        adminSendCsv('users.csv', ['ID', 'Username', 'Email', 'Role', 'Status', 'Created At'], static function () {
+        });
     }
+
+    $stmt = $conn->prepare('SELECT id, username, email, role, status, created_at FROM users ORDER BY id DESC');
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    adminSendCsv('users.csv', ['ID', 'Username', 'Email', 'Role', 'Status', 'Created At'], static function ($output) use ($result) {
+        while ($row = $result->fetch_assoc()) {
+            fputcsv($output, [
+                (int) ($row['id'] ?? 0),
+                (string) ($row['username'] ?? ''),
+                (string) ($row['email'] ?? ''),
+                (string) ($row['role'] ?? ''),
+                (string) ($row['status'] ?? ''),
+                adminFormatTimestamp($row['created_at'] ?? ''),
+            ]);
+        }
+    });
+}
+
+function adminExportSeats(mysqli $conn): void
+{
+    if (!adminTableExists($conn, 'seats')) {
+        adminSendCsv('seats.csv', ['Seat', 'Status', 'Reserved By', 'Reserved At', 'Expires At', 'Reservation Status'], static function () {
+        });
+    }
+
+    $sql = 'SELECT s.seat_number, s.status, s.reserved_at, s.expires_at, s.reservation_status, u.username AS reserved_by'
+        . ' FROM seats s LEFT JOIN users u ON u.id = s.reserved_by ORDER BY s.id ASC';
+    $stmt = $conn->prepare($sql);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    adminSendCsv('seats.csv', ['Seat', 'Status', 'Reserved By', 'Reserved At', 'Expires At', 'Reservation Status'], static function ($output) use ($result) {
+        while ($row = $result->fetch_assoc()) {
+            fputcsv($output, [
+                (string) ($row['seat_number'] ?? ''),
+                (string) ($row['status'] ?? ''),
+                (string) ($row['reserved_by'] ?? ''),
+                adminFormatTimestamp($row['reserved_at'] ?? ''),
+                adminFormatTimestamp($row['expires_at'] ?? ''),
+                (string) ($row['reservation_status'] ?? ''),
+            ]);
+        }
+    });
+}
+
+function adminExportComputers(mysqli $conn): void
+{
+    if (!adminTableExists($conn, 'computers')) {
+        adminSendCsv('computers.csv', ['Computer', 'Status', 'Reserved By', 'Reserved At', 'Expires At', 'Reservation Status'], static function () {
+        });
+    }
+
+    $sql = 'SELECT c.computer_number, c.status, c.reserved_at, c.expires_at, c.reservation_status, u.username AS reserved_by'
+        . ' FROM computers c LEFT JOIN users u ON u.id = c.reserved_by ORDER BY c.id ASC';
+    $stmt = $conn->prepare($sql);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    adminSendCsv('computers.csv', ['Computer', 'Status', 'Reserved By', 'Reserved At', 'Expires At', 'Reservation Status'], static function ($output) use ($result) {
+        while ($row = $result->fetch_assoc()) {
+            fputcsv($output, [
+                (string) ($row['computer_number'] ?? ''),
+                (string) ($row['status'] ?? ''),
+                (string) ($row['reserved_by'] ?? ''),
+                adminFormatTimestamp($row['reserved_at'] ?? ''),
+                adminFormatTimestamp($row['expires_at'] ?? ''),
+                (string) ($row['reservation_status'] ?? ''),
+            ]);
+        }
+    });
+}
+
+function adminExportAuditLog(mysqli $conn, array $filters): void
+{
+    if (!adminTableExists($conn, 'audit_log')) {
+        adminSendCsv('audit_log.csv', ['Date Time', 'Action', 'Actor', 'Role', 'Target Type', 'Target', 'Target ID', 'Details', 'IP Address'], static function () {
+        });
+    }
+
+    [$where, $types, $params] = adminBuildAuditWhere($filters);
+
+    $sql = 'SELECT actor_username, actor_role, action, target_type, target_id, target_label, details, ip_address, created_at'
+        . ' FROM audit_log';
+    if ($where !== []) {
+        $sql .= ' WHERE ' . implode(' AND ', $where);
+    }
+    $sql .= ' ORDER BY id DESC';
+
+    $stmt = $conn->prepare($sql);
+    if ($types !== '') {
+        dbBindParams($stmt, $types, $params);
+    }
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    adminSendCsv('audit_log.csv', ['Date Time', 'Action', 'Actor', 'Role', 'Target Type', 'Target', 'Target ID', 'Details', 'IP Address'], static function ($output) use ($result) {
+        while ($row = $result->fetch_assoc()) {
+            fputcsv($output, [
+                adminFormatTimestamp($row['created_at'] ?? ''),
+                (string) ($row['action'] ?? ''),
+                (string) ($row['actor_username'] ?? ''),
+                (string) ($row['actor_role'] ?? ''),
+                (string) ($row['target_type'] ?? ''),
+                (string) ($row['target_label'] ?? ''),
+                (string) ($row['target_id'] ?? ''),
+                (string) ($row['details'] ?? ''),
+                (string) ($row['ip_address'] ?? ''),
+            ]);
+        }
+    });
+}
+
+$attendanceFilters = adminParseAttendanceFilters();
+$authFilters = adminParseAuthFilters();
+$auditFilters = adminParseAuditFilters();
+$reportFiltersLabel = adminBuildLogFiltersLabel($attendanceFilters, $authFilters, $auditFilters);
+$attendanceFromValue = $attendanceFilters['from'] ? substr($attendanceFilters['from'], 0, 10) : '';
+$attendanceToValue = $attendanceFilters['to'] ? substr($attendanceFilters['to'], 0, 10) : '';
+$authFromValue = $authFilters['from'] ? substr($authFilters['from'], 0, 10) : '';
+$authToValue = $authFilters['to'] ? substr($authFilters['to'], 0, 10) : '';
+$auditFromValue = $auditFilters['from'] ? substr($auditFilters['from'], 0, 10) : '';
+$auditToValue = $auditFilters['to'] ? substr($auditFilters['to'], 0, 10) : '';
+
+if (isset($_GET['export'])) {
     $export = trim((string) $_GET['export']);
     if ($export === 'attendance-events') {
-        adminExportAttendanceEvents($conn);
+        if (!$canViewLogs) {
+            http_response_code(403);
+            exit('Access denied.');
+        }
+        adminExportAttendanceEvents($conn, $attendanceFilters);
     } elseif ($export === 'attendance-sessions') {
-        adminExportAttendanceSessions($conn);
+        if (!$canViewLogs) {
+            http_response_code(403);
+            exit('Access denied.');
+        }
+        adminExportAttendanceSessions($conn, $attendanceFilters);
     } elseif ($export === 'auth-events') {
-        adminExportAuthEvents($conn);
+        if (!$canViewLogs) {
+            http_response_code(403);
+            exit('Access denied.');
+        }
+        adminExportAuthEvents($conn, $authFilters);
     } elseif ($export === 'auth-sessions') {
-        adminExportAuthSessions($conn);
+        if (!$canViewLogs) {
+            http_response_code(403);
+            exit('Access denied.');
+        }
+        adminExportAuthSessions($conn, $authFilters);
+    } elseif ($export === 'audit-log') {
+        if (!$canViewLogs) {
+            http_response_code(403);
+            exit('Access denied.');
+        }
+        adminExportAuditLog($conn, $auditFilters);
+    } elseif ($export === 'users') {
+        if (!$canManageUsers) {
+            http_response_code(403);
+            exit('Access denied.');
+        }
+        adminExportUsers($conn);
+    } elseif ($export === 'seats') {
+        if (!$canManageUsers) {
+            http_response_code(403);
+            exit('Access denied.');
+        }
+        adminExportSeats($conn);
+    } elseif ($export === 'computers') {
+        if (!$canManageUsers) {
+            http_response_code(403);
+            exit('Access denied.');
+        }
+        adminExportComputers($conn);
     }
 }
 
@@ -587,8 +1051,24 @@ $attendanceEventsStart = 0;
 $attendanceEventsEnd = 0;
 
 if ($attendanceLogAvailable) {
-    $countResult = mysqli_query($conn, 'SELECT COUNT(*) AS total FROM attendance');
-    $attendanceEventsTotal = (int) mysqli_fetch_assoc($countResult)['total'];
+    [$attendanceEventWhere, $attendanceEventTypes, $attendanceEventParams]
+        = adminBuildAttendanceWhere($attendanceFilters, $attendanceHasUserId, $attendanceHasDevice, true);
+
+    $countSql = 'SELECT COUNT(*) AS total FROM attendance a';
+    if ($attendanceHasUserId) {
+        $countSql .= ' LEFT JOIN users u ON u.id = a.user_id';
+    }
+    if ($attendanceEventWhere !== []) {
+        $countSql .= ' WHERE ' . implode(' AND ', $attendanceEventWhere);
+    }
+    $stmt = $conn->prepare($countSql);
+    if ($attendanceEventTypes !== '') {
+        dbBindParams($stmt, $attendanceEventTypes, $attendanceEventParams);
+    }
+    $stmt->execute();
+    $countRow = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    $attendanceEventsTotal = (int) ($countRow['total'] ?? 0);
     if ($isPrintLogs) {
         $attendanceEventsPage = 1;
         $attendanceEventsTotalPages = 1;
@@ -615,14 +1095,24 @@ if ($attendanceLogAvailable) {
     if ($attendanceHasUserId) {
         $sql .= ' LEFT JOIN users u ON u.id = a.user_id';
     }
+    if ($attendanceEventWhere !== []) {
+        $sql .= ' WHERE ' . implode(' AND ', $attendanceEventWhere);
+    }
     $sql .= ' ORDER BY a.id DESC';
     if (!$isPrintLogs) {
         $sql .= ' LIMIT ? OFFSET ?';
     }
 
     $stmt = $conn->prepare($sql);
+    $eventTypes = $attendanceEventTypes;
+    $eventParams = $attendanceEventParams;
     if (!$isPrintLogs) {
-        $stmt->bind_param('ii', $attendanceEventsPerPage, $attendanceEventsOffset);
+        $eventTypes .= 'ii';
+        $eventParams[] = $attendanceEventsPerPage;
+        $eventParams[] = $attendanceEventsOffset;
+    }
+    if ($eventTypes !== '') {
+        dbBindParams($stmt, $eventTypes, $eventParams);
     }
     $stmt->execute();
     $attendanceEvents = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
@@ -639,8 +1129,25 @@ $attendanceSessionsStart = 0;
 $attendanceSessionsEnd = 0;
 
 if ($attendanceLogAvailable) {
-    $countResult = mysqli_query($conn, "SELECT COUNT(*) AS total FROM attendance WHERE action = 'TIME_IN'");
-    $attendanceSessionsTotal = (int) mysqli_fetch_assoc($countResult)['total'];
+    [$attendanceSessionWhere, $attendanceSessionTypes, $attendanceSessionParams]
+        = adminBuildAttendanceWhere($attendanceFilters, $attendanceHasUserId, $attendanceHasDevice, false);
+    $attendanceSessionWhere[] = "a.action = 'TIME_IN'";
+
+    $countSql = 'SELECT COUNT(*) AS total FROM attendance a';
+    if ($attendanceHasUserId) {
+        $countSql .= ' LEFT JOIN users u ON u.id = a.user_id';
+    }
+    if ($attendanceSessionWhere !== []) {
+        $countSql .= ' WHERE ' . implode(' AND ', $attendanceSessionWhere);
+    }
+    $stmt = $conn->prepare($countSql);
+    if ($attendanceSessionTypes !== '') {
+        dbBindParams($stmt, $attendanceSessionTypes, $attendanceSessionParams);
+    }
+    $stmt->execute();
+    $countRow = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    $attendanceSessionsTotal = (int) ($countRow['total'] ?? 0);
     if ($isPrintLogs) {
         $attendanceSessionsPage = 1;
         $attendanceSessionsTotalPages = 1;
@@ -687,14 +1194,24 @@ if ($attendanceLogAvailable) {
     if ($attendanceHasUserId) {
         $sql .= ' LEFT JOIN users u ON u.id = a.user_id';
     }
-    $sql .= " WHERE a.action = 'TIME_IN' ORDER BY a.id DESC";
+    if ($attendanceSessionWhere !== []) {
+        $sql .= ' WHERE ' . implode(' AND ', $attendanceSessionWhere);
+    }
+    $sql .= ' ORDER BY a.id DESC';
     if (!$isPrintLogs) {
         $sql .= ' LIMIT ? OFFSET ?';
     }
 
     $stmt = $conn->prepare($sql);
+    $sessionTypes = $attendanceSessionTypes;
+    $sessionParams = $attendanceSessionParams;
     if (!$isPrintLogs) {
-        $stmt->bind_param('ii', $attendanceSessionsPerPage, $attendanceSessionsOffset);
+        $sessionTypes .= 'ii';
+        $sessionParams[] = $attendanceSessionsPerPage;
+        $sessionParams[] = $attendanceSessionsOffset;
+    }
+    if ($sessionTypes !== '') {
+        dbBindParams($stmt, $sessionTypes, $sessionParams);
     }
     $stmt->execute();
     $attendanceSessions = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
@@ -714,8 +1231,29 @@ if ($attendanceLogAvailable) {
 
 $attendanceTimeInTotal = $attendanceSessionsTotal;
 if ($attendanceLogAvailable) {
-    $countResult = mysqli_query($conn, "SELECT COUNT(*) AS total FROM attendance WHERE action = 'TIME_OUT'");
-    $attendanceTimeOutTotal = (int) mysqli_fetch_assoc($countResult)['total'];
+    $attendanceOutWhere = $attendanceSessionWhere;
+    $attendanceOutTypes = $attendanceSessionTypes;
+    $attendanceOutParams = $attendanceSessionParams;
+    $attendanceOutWhere = array_values(array_filter($attendanceOutWhere, static function ($clause) {
+        return $clause !== "a.action = 'TIME_IN'";
+    }));
+    $attendanceOutWhere[] = "a.action = 'TIME_OUT'";
+
+    $countSql = 'SELECT COUNT(*) AS total FROM attendance a';
+    if ($attendanceHasUserId) {
+        $countSql .= ' LEFT JOIN users u ON u.id = a.user_id';
+    }
+    if ($attendanceOutWhere !== []) {
+        $countSql .= ' WHERE ' . implode(' AND ', $attendanceOutWhere);
+    }
+    $stmt = $conn->prepare($countSql);
+    if ($attendanceOutTypes !== '') {
+        dbBindParams($stmt, $attendanceOutTypes, $attendanceOutParams);
+    }
+    $stmt->execute();
+    $countRow = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    $attendanceTimeOutTotal = (int) ($countRow['total'] ?? 0);
 }
 
 $authLogAvailable = adminTableExists($conn, 'auth_log');
@@ -729,8 +1267,21 @@ $authEventsStart = 0;
 $authEventsEnd = 0;
 
 if ($authLogAvailable) {
-    $countResult = mysqli_query($conn, "SELECT COUNT(*) AS total FROM auth_log WHERE action <> 'heartbeat'");
-    $authEventsTotal = (int) mysqli_fetch_assoc($countResult)['total'];
+    [$authEventWhere, $authEventTypes, $authEventParams] = adminBuildAuthWhere($authFilters, true);
+    $authEventWhere[] = "l.action <> 'heartbeat'";
+
+    $countSql = 'SELECT COUNT(*) AS total FROM auth_log l';
+    if ($authEventWhere !== []) {
+        $countSql .= ' WHERE ' . implode(' AND ', $authEventWhere);
+    }
+    $stmt = $conn->prepare($countSql);
+    if ($authEventTypes !== '') {
+        dbBindParams($stmt, $authEventTypes, $authEventParams);
+    }
+    $stmt->execute();
+    $countRow = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    $authEventsTotal = (int) ($countRow['total'] ?? 0);
     if ($isPrintLogs) {
         $authEventsPage = 1;
         $authEventsTotalPages = 1;
@@ -742,14 +1293,25 @@ if ($authLogAvailable) {
             = adminPaginationState($authEventsTotal, $authEventsPerPage, $authEventsPage);
     }
 
-    $sql = "SELECT id, user_id, username, role, identity, action, session_id, ip_address, user_agent, created_at"
-        . " FROM auth_log WHERE action <> 'heartbeat' ORDER BY id DESC";
+    $sql = "SELECT l.id, l.user_id, l.username, l.role, l.identity, l.action, l.session_id, l.ip_address, l.user_agent, l.created_at"
+        . " FROM auth_log l";
+    if ($authEventWhere !== []) {
+        $sql .= ' WHERE ' . implode(' AND ', $authEventWhere);
+    }
+    $sql .= ' ORDER BY l.id DESC';
     if (!$isPrintLogs) {
         $sql .= ' LIMIT ? OFFSET ?';
     }
     $stmt = $conn->prepare($sql);
+    $eventTypes = $authEventTypes;
+    $eventParams = $authEventParams;
     if (!$isPrintLogs) {
-        $stmt->bind_param('ii', $authEventsPerPage, $authEventsOffset);
+        $eventTypes .= 'ii';
+        $eventParams[] = $authEventsPerPage;
+        $eventParams[] = $authEventsOffset;
+    }
+    if ($eventTypes !== '') {
+        dbBindParams($stmt, $eventTypes, $eventParams);
     }
     $stmt->execute();
     $authEvents = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
@@ -766,8 +1328,21 @@ $authSessionsStart = 0;
 $authSessionsEnd = 0;
 
 if ($authLogAvailable) {
-    $countResult = mysqli_query($conn, "SELECT COUNT(*) AS total FROM auth_log WHERE action = 'login_success'");
-    $authSessionsTotal = (int) mysqli_fetch_assoc($countResult)['total'];
+    [$authSessionWhere, $authSessionTypes, $authSessionParams] = adminBuildAuthWhere($authFilters, false);
+    $authSessionWhere[] = "l.action = 'login_success'";
+
+    $countSql = 'SELECT COUNT(*) AS total FROM auth_log l';
+    if ($authSessionWhere !== []) {
+        $countSql .= ' WHERE ' . implode(' AND ', $authSessionWhere);
+    }
+    $stmt = $conn->prepare($countSql);
+    if ($authSessionTypes !== '') {
+        dbBindParams($stmt, $authSessionTypes, $authSessionParams);
+    }
+    $stmt->execute();
+    $countRow = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    $authSessionsTotal = (int) ($countRow['total'] ?? 0);
     if ($isPrintLogs) {
         $authSessionsPage = 1;
         $authSessionsTotalPages = 1;
@@ -787,13 +1362,24 @@ if ($authLogAvailable) {
         . " (SELECT l2.created_at FROM auth_log l2 WHERE l2.action = 'logout' AND l2.id > l.id AND {$matchCondition} ORDER BY l2.id ASC LIMIT 1) AS logout_at,"
         . " ({$lastActivitySql}) AS last_activity_at,"
         . " ({$idleSecondsSql}) AS idle_seconds"
-        . " FROM auth_log l WHERE l.action = 'login_success' ORDER BY l.id DESC";
+        . " FROM auth_log l";
+    if ($authSessionWhere !== []) {
+        $sql .= ' WHERE ' . implode(' AND ', $authSessionWhere);
+    }
+    $sql .= ' ORDER BY l.id DESC';
     if (!$isPrintLogs) {
         $sql .= ' LIMIT ? OFFSET ?';
     }
     $stmt = $conn->prepare($sql);
+    $sessionTypes = $authSessionTypes;
+    $sessionParams = $authSessionParams;
     if (!$isPrintLogs) {
-        $stmt->bind_param('ii', $authSessionsPerPage, $authSessionsOffset);
+        $sessionTypes .= 'ii';
+        $sessionParams[] = $authSessionsPerPage;
+        $sessionParams[] = $authSessionsOffset;
+    }
+    if ($sessionTypes !== '') {
+        dbBindParams($stmt, $sessionTypes, $sessionParams);
     }
     $stmt->execute();
     $authSessions = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
@@ -818,8 +1404,89 @@ if ($authLogAvailable) {
 
 $authLoginSuccessTotal = $authSessionsTotal;
 if ($authLogAvailable) {
-    $countResult = mysqli_query($conn, "SELECT COUNT(*) AS total FROM auth_log WHERE action = 'login_failed'");
-    $authLoginFailedTotal = (int) mysqli_fetch_assoc($countResult)['total'];
+    $authFailedWhere = $authSessionWhere;
+    $authFailedTypes = $authSessionTypes;
+    $authFailedParams = $authSessionParams;
+    $authFailedWhere = array_values(array_filter($authFailedWhere, static function ($clause) {
+        return $clause !== "l.action = 'login_success'";
+    }));
+    $authFailedWhere[] = "l.action = 'login_failed'";
+
+    $countSql = 'SELECT COUNT(*) AS total FROM auth_log l';
+    if ($authFailedWhere !== []) {
+        $countSql .= ' WHERE ' . implode(' AND ', $authFailedWhere);
+    }
+    $stmt = $conn->prepare($countSql);
+    if ($authFailedTypes !== '') {
+        dbBindParams($stmt, $authFailedTypes, $authFailedParams);
+    }
+    $stmt->execute();
+    $countRow = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    $authLoginFailedTotal = (int) ($countRow['total'] ?? 0);
+}
+
+$auditLogAvailable = adminTableExists($conn, 'audit_log');
+$auditEvents = [];
+$auditEventsTotal = 0;
+$auditEventsPerPage = 10;
+$auditEventsPage = $isPrintLogs ? 1 : adminClampPage($_GET['auditPage'] ?? 1);
+$auditEventsTotalPages = 1;
+$auditEventsOffset = 0;
+$auditEventsStart = 0;
+$auditEventsEnd = 0;
+
+if ($auditLogAvailable) {
+    [$auditWhere, $auditTypes, $auditParams] = adminBuildAuditWhere($auditFilters);
+
+    $countSql = 'SELECT COUNT(*) AS total FROM audit_log';
+    if ($auditWhere !== []) {
+        $countSql .= ' WHERE ' . implode(' AND ', $auditWhere);
+    }
+    $stmt = $conn->prepare($countSql);
+    if ($auditTypes !== '') {
+        dbBindParams($stmt, $auditTypes, $auditParams);
+    }
+    $stmt->execute();
+    $countRow = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    $auditEventsTotal = (int) ($countRow['total'] ?? 0);
+
+    if ($isPrintLogs) {
+        $auditEventsPage = 1;
+        $auditEventsTotalPages = 1;
+        $auditEventsOffset = 0;
+        $auditEventsStart = $auditEventsTotal > 0 ? 1 : 0;
+        $auditEventsEnd = $auditEventsTotal;
+    } else {
+        [$auditEventsPage, $auditEventsTotalPages, $auditEventsOffset, $auditEventsStart, $auditEventsEnd]
+            = adminPaginationState($auditEventsTotal, $auditEventsPerPage, $auditEventsPage);
+    }
+
+    $sql = 'SELECT id, actor_username, actor_role, action, target_type, target_id, target_label, details, ip_address, created_at'
+        . ' FROM audit_log';
+    if ($auditWhere !== []) {
+        $sql .= ' WHERE ' . implode(' AND ', $auditWhere);
+    }
+    $sql .= ' ORDER BY id DESC';
+    if (!$isPrintLogs) {
+        $sql .= ' LIMIT ? OFFSET ?';
+    }
+
+    $stmt = $conn->prepare($sql);
+    $auditPageTypes = $auditTypes;
+    $auditPageParams = $auditParams;
+    if (!$isPrintLogs) {
+        $auditPageTypes .= 'ii';
+        $auditPageParams[] = $auditEventsPerPage;
+        $auditPageParams[] = $auditEventsOffset;
+    }
+    if ($auditPageTypes !== '') {
+        dbBindParams($stmt, $auditPageTypes, $auditPageParams);
+    }
+    $stmt->execute();
+    $auditEvents = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
 }
 
 $rfidUidByUserId = [];
@@ -1594,6 +2261,64 @@ tbody tr:last-child td { border-bottom: none; }
     margin-bottom: 14px;
 }
 
+.filter-panel {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    margin-bottom: 14px;
+    box-shadow: var(--shadow-sm);
+}
+
+.filter-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 10px;
+    align-items: end;
+}
+
+.filter-field label {
+    display: block;
+    font-size: 0.70rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+}
+
+.filter-field input,
+.filter-field select {
+    width: 100%;
+    border: 1px solid var(--glass-border);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-main);
+    padding: 8px 10px;
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.82rem;
+    transition: all var(--transition);
+}
+
+.filter-field input:focus,
+.filter-field select:focus {
+    outline: none;
+    border-color: rgba(200, 169, 110, 0.55);
+    box-shadow: 0 0 0 2px rgba(200, 169, 110, 0.18);
+}
+
+.filter-field select option {
+    background: #111820;
+    color: var(--text-main);
+}
+
+.filter-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+}
+
 .rfid-btn {
     display: inline-flex;
     align-items: center;
@@ -2216,6 +2941,20 @@ tbody tr:last-child td { border-bottom: none; }
                 Use the sidebar to manage users, monitor seat and computer allocations,
                 and keep the library system running smoothly.
             </div>
+
+            <?php if ($canManageUsers || $canViewLogs): ?>
+            <div class="section-title" style="margin-top:20px;">Exports &amp; Backups</div>
+            <div class="rfid-actions-grid">
+                <?php if ($canManageUsers): ?>
+                    <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'dashboard', 'export' => 'users'])) ?>">⬇️ Export Users CSV</a>
+                    <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'dashboard', 'export' => 'seats'])) ?>">⬇️ Export Seats CSV</a>
+                    <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'dashboard', 'export' => 'computers'])) ?>">⬇️ Export Computers CSV</a>
+                <?php endif; ?>
+                <?php if ($canViewLogs): ?>
+                    <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'export' => 'audit-log', 'auditPage' => null])) ?>">⬇️ Export Audit Log CSV</a>
+                <?php endif; ?>
+            </div>
+            <?php endif; ?>
         </section>
 
         <?php if ($canManageUsers): ?>
@@ -2524,7 +3263,73 @@ tbody tr:last-child td { border-bottom: none; }
                 <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'export' => 'attendance-sessions', 'attSessionPage' => null])) ?>">⬇️ Export Attendance Sessions CSV</a>
                 <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'export' => 'auth-events', 'authPage' => null])) ?>">⬇️ Export Login Events CSV</a>
                 <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'export' => 'auth-sessions', 'authSessionPage' => null])) ?>">⬇️ Export Login Sessions CSV</a>
+                <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'export' => 'audit-log', 'auditPage' => null])) ?>">⬇️ Export Audit Log CSV</a>
                 <button type="button" class="rfid-btn warn" id="btnPrintLogs">🖨️ Print Logs</button>
+            </div>
+
+            <div class="filter-panel no-print">
+                <form method="get" class="filter-grid" id="attendanceFilterForm">
+                    <input type="hidden" name="tab" value="logs">
+                    <input type="hidden" name="auth_from" value="<?= htmlspecialchars($authFromValue) ?>">
+                    <input type="hidden" name="auth_to" value="<?= htmlspecialchars($authToValue) ?>">
+                    <input type="hidden" name="auth_action" value="<?= htmlspecialchars((string) ($authFilters['action'] ?? '')) ?>">
+                    <input type="hidden" name="auth_user" value="<?= htmlspecialchars((string) ($authFilters['user'] ?? '')) ?>">
+                    <input type="hidden" name="auth_ip" value="<?= htmlspecialchars((string) ($authFilters['ip'] ?? '')) ?>">
+                    <input type="hidden" name="audit_from" value="<?= htmlspecialchars($auditFromValue) ?>">
+                    <input type="hidden" name="audit_to" value="<?= htmlspecialchars($auditToValue) ?>">
+                    <input type="hidden" name="audit_action" value="<?= htmlspecialchars((string) ($auditFilters['action'] ?? '')) ?>">
+                    <input type="hidden" name="audit_actor" value="<?= htmlspecialchars((string) ($auditFilters['actor'] ?? '')) ?>">
+                    <input type="hidden" name="audit_target" value="<?= htmlspecialchars((string) ($auditFilters['target'] ?? '')) ?>">
+                    <input type="hidden" name="audit_ip" value="<?= htmlspecialchars((string) ($auditFilters['ip'] ?? '')) ?>">
+                    <input type="hidden" name="attPage" value="">
+                    <input type="hidden" name="attSessionPage" value="">
+                    <input type="hidden" name="authPage" value="">
+                    <input type="hidden" name="authSessionPage" value="">
+                    <input type="hidden" name="auditPage" value="">
+
+                    <div class="filter-field">
+                        <label for="att_from">Attendance From</label>
+                        <input type="date" id="att_from" name="att_from" value="<?= htmlspecialchars($attendanceFromValue) ?>">
+                    </div>
+                    <div class="filter-field">
+                        <label for="att_to">Attendance To</label>
+                        <input type="date" id="att_to" name="att_to" value="<?= htmlspecialchars($attendanceToValue) ?>">
+                    </div>
+                    <div class="filter-field">
+                        <label for="att_action">Action</label>
+                        <select id="att_action" name="att_action">
+                            <option value="">All</option>
+                            <option value="TIME_IN" <?= ($attendanceFilters['action'] ?? '') === 'TIME_IN' ? 'selected' : '' ?>>TIME_IN</option>
+                            <option value="TIME_OUT" <?= ($attendanceFilters['action'] ?? '') === 'TIME_OUT' ? 'selected' : '' ?>>TIME_OUT</option>
+                        </select>
+                    </div>
+                    <div class="filter-field">
+                        <label for="att_user">User / UID</label>
+                        <input type="text" id="att_user" name="att_user" value="<?= htmlspecialchars((string) ($attendanceFilters['user'] ?? '')) ?>" placeholder="Name, username, email, UID">
+                    </div>
+                    <?php if ($attendanceHasDevice): ?>
+                    <div class="filter-field">
+                        <label for="att_device">Device</label>
+                        <input type="text" id="att_device" name="att_device" value="<?= htmlspecialchars((string) ($attendanceFilters['device'] ?? '')) ?>" placeholder="Device name">
+                    </div>
+                    <?php endif; ?>
+                    <div class="filter-field">
+                        <label>&nbsp;</label>
+                        <div class="filter-actions">
+                            <button type="submit" class="rfid-btn">Apply Attendance Filters</button>
+                            <a class="rfid-btn warn" href="?<?= htmlspecialchars(adminBuildQuery([
+                                'tab' => 'logs',
+                                'att_from' => null,
+                                'att_to' => null,
+                                'att_action' => null,
+                                'att_user' => null,
+                                'att_device' => null,
+                                'attPage' => null,
+                                'attSessionPage' => null,
+                            ])) ?>">Clear</a>
+                        </div>
+                    </div>
+                </form>
             </div>
 
             <div class="section-subtitle">RFID Attendance Events</div>
@@ -2731,6 +3536,70 @@ tbody tr:last-child td { border-bottom: none; }
 
             <div class="section-subtitle">Web Login Events</div>
 
+            <div class="filter-panel no-print">
+                <form method="get" class="filter-grid" id="authFilterForm">
+                    <input type="hidden" name="tab" value="logs">
+                    <input type="hidden" name="att_from" value="<?= htmlspecialchars($attendanceFromValue) ?>">
+                    <input type="hidden" name="att_to" value="<?= htmlspecialchars($attendanceToValue) ?>">
+                    <input type="hidden" name="att_action" value="<?= htmlspecialchars((string) ($attendanceFilters['action'] ?? '')) ?>">
+                    <input type="hidden" name="att_user" value="<?= htmlspecialchars((string) ($attendanceFilters['user'] ?? '')) ?>">
+                    <input type="hidden" name="att_device" value="<?= htmlspecialchars((string) ($attendanceFilters['device'] ?? '')) ?>">
+                    <input type="hidden" name="audit_from" value="<?= htmlspecialchars($auditFromValue) ?>">
+                    <input type="hidden" name="audit_to" value="<?= htmlspecialchars($auditToValue) ?>">
+                    <input type="hidden" name="audit_action" value="<?= htmlspecialchars((string) ($auditFilters['action'] ?? '')) ?>">
+                    <input type="hidden" name="audit_actor" value="<?= htmlspecialchars((string) ($auditFilters['actor'] ?? '')) ?>">
+                    <input type="hidden" name="audit_target" value="<?= htmlspecialchars((string) ($auditFilters['target'] ?? '')) ?>">
+                    <input type="hidden" name="audit_ip" value="<?= htmlspecialchars((string) ($auditFilters['ip'] ?? '')) ?>">
+                    <input type="hidden" name="attPage" value="">
+                    <input type="hidden" name="attSessionPage" value="">
+                    <input type="hidden" name="authPage" value="">
+                    <input type="hidden" name="authSessionPage" value="">
+                    <input type="hidden" name="auditPage" value="">
+
+                    <div class="filter-field">
+                        <label for="auth_from">Auth From</label>
+                        <input type="date" id="auth_from" name="auth_from" value="<?= htmlspecialchars($authFromValue) ?>">
+                    </div>
+                    <div class="filter-field">
+                        <label for="auth_to">Auth To</label>
+                        <input type="date" id="auth_to" name="auth_to" value="<?= htmlspecialchars($authToValue) ?>">
+                    </div>
+                    <div class="filter-field">
+                        <label for="auth_action">Action</label>
+                        <select id="auth_action" name="auth_action">
+                            <option value="">All</option>
+                            <option value="login_success" <?= ($authFilters['action'] ?? '') === 'login_success' ? 'selected' : '' ?>>Login</option>
+                            <option value="login_failed" <?= ($authFilters['action'] ?? '') === 'login_failed' ? 'selected' : '' ?>>Login Failed</option>
+                            <option value="logout" <?= ($authFilters['action'] ?? '') === 'logout' ? 'selected' : '' ?>>Logout</option>
+                        </select>
+                    </div>
+                    <div class="filter-field">
+                        <label for="auth_user">User / Identity</label>
+                        <input type="text" id="auth_user" name="auth_user" value="<?= htmlspecialchars((string) ($authFilters['user'] ?? '')) ?>" placeholder="Username or identity">
+                    </div>
+                    <div class="filter-field">
+                        <label for="auth_ip">IP Address</label>
+                        <input type="text" id="auth_ip" name="auth_ip" value="<?= htmlspecialchars((string) ($authFilters['ip'] ?? '')) ?>" placeholder="IP address">
+                    </div>
+                    <div class="filter-field">
+                        <label>&nbsp;</label>
+                        <div class="filter-actions">
+                            <button type="submit" class="rfid-btn">Apply Auth Filters</button>
+                            <a class="rfid-btn warn" href="?<?= htmlspecialchars(adminBuildQuery([
+                                'tab' => 'logs',
+                                'auth_from' => null,
+                                'auth_to' => null,
+                                'auth_action' => null,
+                                'auth_user' => null,
+                                'auth_ip' => null,
+                                'authPage' => null,
+                                'authSessionPage' => null,
+                            ])) ?>">Clear</a>
+                        </div>
+                    </div>
+                </form>
+            </div>
+
             <div class="table-wrap">
                 <div class="table-scroll">
                     <table>
@@ -2915,6 +3784,169 @@ tbody tr:last-child td { border-bottom: none; }
                             </div>
                             <?php if ($authSessionsPage < $authSessionsTotalPages): ?>
                                 <a class="page-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'authSessionPage' => $authSessionsPage + 1])) ?>">Next</a>
+                            <?php else: ?>
+                                <button type="button" class="page-btn" disabled>Next</button>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                <?php endif; ?>
+            </div>
+
+            <div class="section-subtitle">Admin Actions (Audit Log)</div>
+
+            <div class="filter-panel no-print">
+                <form method="get" class="filter-grid" id="auditFilterForm">
+                    <input type="hidden" name="tab" value="logs">
+                    <input type="hidden" name="att_from" value="<?= htmlspecialchars($attendanceFromValue) ?>">
+                    <input type="hidden" name="att_to" value="<?= htmlspecialchars($attendanceToValue) ?>">
+                    <input type="hidden" name="att_action" value="<?= htmlspecialchars((string) ($attendanceFilters['action'] ?? '')) ?>">
+                    <input type="hidden" name="att_user" value="<?= htmlspecialchars((string) ($attendanceFilters['user'] ?? '')) ?>">
+                    <input type="hidden" name="att_device" value="<?= htmlspecialchars((string) ($attendanceFilters['device'] ?? '')) ?>">
+                    <input type="hidden" name="auth_from" value="<?= htmlspecialchars($authFromValue) ?>">
+                    <input type="hidden" name="auth_to" value="<?= htmlspecialchars($authToValue) ?>">
+                    <input type="hidden" name="auth_action" value="<?= htmlspecialchars((string) ($authFilters['action'] ?? '')) ?>">
+                    <input type="hidden" name="auth_user" value="<?= htmlspecialchars((string) ($authFilters['user'] ?? '')) ?>">
+                    <input type="hidden" name="auth_ip" value="<?= htmlspecialchars((string) ($authFilters['ip'] ?? '')) ?>">
+                    <input type="hidden" name="attPage" value="">
+                    <input type="hidden" name="attSessionPage" value="">
+                    <input type="hidden" name="authPage" value="">
+                    <input type="hidden" name="authSessionPage" value="">
+                    <input type="hidden" name="auditPage" value="">
+
+                    <div class="filter-field">
+                        <label for="audit_from">Audit From</label>
+                        <input type="date" id="audit_from" name="audit_from" value="<?= htmlspecialchars($auditFromValue) ?>">
+                    </div>
+                    <div class="filter-field">
+                        <label for="audit_to">Audit To</label>
+                        <input type="date" id="audit_to" name="audit_to" value="<?= htmlspecialchars($auditToValue) ?>">
+                    </div>
+                    <div class="filter-field">
+                        <label for="audit_action">Action</label>
+                        <input type="text" id="audit_action" name="audit_action" value="<?= htmlspecialchars((string) ($auditFilters['action'] ?? '')) ?>" placeholder="Action key">
+                    </div>
+                    <div class="filter-field">
+                        <label for="audit_actor">Actor</label>
+                        <input type="text" id="audit_actor" name="audit_actor" value="<?= htmlspecialchars((string) ($auditFilters['actor'] ?? '')) ?>" placeholder="Username or role">
+                    </div>
+                    <div class="filter-field">
+                        <label for="audit_target">Target</label>
+                        <input type="text" id="audit_target" name="audit_target" value="<?= htmlspecialchars((string) ($auditFilters['target'] ?? '')) ?>" placeholder="Target label or ID">
+                    </div>
+                    <div class="filter-field">
+                        <label for="audit_ip">IP Address</label>
+                        <input type="text" id="audit_ip" name="audit_ip" value="<?= htmlspecialchars((string) ($auditFilters['ip'] ?? '')) ?>" placeholder="IP address">
+                    </div>
+                    <div class="filter-field">
+                        <label>&nbsp;</label>
+                        <div class="filter-actions">
+                            <button type="submit" class="rfid-btn">Apply Audit Filters</button>
+                            <a class="rfid-btn warn" href="?<?= htmlspecialchars(adminBuildQuery([
+                                'tab' => 'logs',
+                                'audit_from' => null,
+                                'audit_to' => null,
+                                'audit_action' => null,
+                                'audit_actor' => null,
+                                'audit_target' => null,
+                                'audit_ip' => null,
+                                'auditPage' => null,
+                            ])) ?>">Clear</a>
+                        </div>
+                    </div>
+                </form>
+            </div>
+
+            <div class="table-wrap">
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date &amp; Time</th>
+                                <th>Action</th>
+                                <th>Actor</th>
+                                <th>Target</th>
+                                <th>IP Address</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php if (!$auditLogAvailable): ?>
+                                <tr class="empty-row"><td colspan="6">Audit log table not available.</td></tr>
+                            <?php elseif (empty($auditEvents)): ?>
+                                <tr class="empty-row"><td colspan="6">No audit events found.</td></tr>
+                            <?php else: ?>
+                                <?php foreach ($auditEvents as $row): ?>
+                                    <?php
+                                    $actorLabel = (string) ($row['actor_username'] ?? '');
+                                    if ($actorLabel === '') {
+                                        $actorLabel = '—';
+                                    }
+                                    $actorMeta = (string) ($row['actor_role'] ?? '');
+                                    $targetLabel = (string) ($row['target_label'] ?? '');
+                                    $targetType = (string) ($row['target_type'] ?? '');
+                                    $targetId = (string) ($row['target_id'] ?? '');
+                                    if ($targetLabel === '' && $targetId !== '') {
+                                        $targetLabel = 'ID #' . $targetId;
+                                    }
+                                    if ($targetLabel === '') {
+                                        $targetLabel = '—';
+                                    }
+                                    $details = (string) ($row['details'] ?? '');
+                                    $detailsShort = $details !== '' ? adminTruncate($details, 80) : '—';
+                                    ?>
+                                    <tr>
+                                        <td><?= htmlspecialchars(adminFormatTimestamp($row['created_at'] ?? '')) ?></td>
+                                        <td><span class="badge info"><?= htmlspecialchars((string) ($row['action'] ?? '')) ?></span></td>
+                                        <td>
+                                            <span style="font-weight:600; color:var(--text-main);">
+                                                <?= htmlspecialchars($actorLabel) ?>
+                                            </span>
+                                            <?php if ($actorMeta !== ''): ?>
+                                                <span class="cell-sub"><?= htmlspecialchars(ucfirst($actorMeta)) ?></span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <span style="font-weight:600; color:var(--text-main);">
+                                                <?= htmlspecialchars($targetLabel) ?>
+                                            </span>
+                                            <?php if ($targetType !== ''): ?>
+                                                <span class="cell-sub"><?= htmlspecialchars($targetType) ?></span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td><?= htmlspecialchars((string) ($row['ip_address'] ?? '—')) ?></td>
+                                        <td title="<?= htmlspecialchars($details) ?>">
+                                            <?= htmlspecialchars($detailsShort) ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <?php if ($auditLogAvailable && $auditEventsTotalPages > 1): ?>
+                    <div class="table-pagination">
+                        <div class="pagination-meta">
+                            Showing <?= $auditEventsStart ?>-<?= $auditEventsEnd ?> of <?= $auditEventsTotal ?> entries
+                        </div>
+                        <div class="pagination-controls">
+                            <?php if ($auditEventsPage > 1): ?>
+                                <a class="page-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'auditPage' => $auditEventsPage - 1])) ?>">Prev</a>
+                            <?php else: ?>
+                                <button type="button" class="page-btn" disabled>Prev</button>
+                            <?php endif; ?>
+                            <div class="pagination-pages" aria-label="Audit event page list">
+                                <?php foreach (adminPaginationTokens($auditEventsTotalPages, $auditEventsPage) as $token): ?>
+                                    <?php if (!is_int($token)): ?>
+                                        <span class="page-ellipsis">…</span>
+                                    <?php elseif ($token === $auditEventsPage): ?>
+                                        <button type="button" class="page-number" aria-current="page" disabled><?= $token ?></button>
+                                    <?php else: ?>
+                                        <a class="page-number" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'auditPage' => $token])) ?>"><?= $token ?></a>
+                                    <?php endif; ?>
+                                <?php endforeach; ?>
+                            </div>
+                            <?php if ($auditEventsPage < $auditEventsTotalPages): ?>
+                                <a class="page-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'auditPage' => $auditEventsPage + 1])) ?>">Next</a>
                             <?php else: ?>
                                 <button type="button" class="page-btn" disabled>Next</button>
                             <?php endif; ?>

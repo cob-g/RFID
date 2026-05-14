@@ -21,27 +21,25 @@ if (isset($_POST['login'])) {
 
             if (password_verify($password, $user['password'])) {
                 session_regenerate_id(true);
-                $_SESSION['user_id'] = $user['id'];
+                $_SESSION['user_id']  = $user['id'];
                 $_SESSION['username'] = $user['username'];
-                $_SESSION['role'] = $user['role'];
-                $_SESSION['email'] = $user['email'];
+                $_SESSION['role']     = $user['role'];
+                $_SESSION['email']    = $user['email'];
 
                 authLogWrite($conn, [
-                    'user_id' => (int) $user['id'],
-                    'username' => (string) $user['username'],
-                    'role' => (string) $user['role'],
-                    'identity' => (string) $username,
-                    'action' => 'login_success',
+                    'user_id'    => (int)    $user['id'],
+                    'username'   => (string) $user['username'],
+                    'role'       => (string) $user['role'],
+                    'identity'   => (string) $username,
+                    'action'     => 'login_success',
                     'session_id' => session_id(),
-                    'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
+                    'ip_address' => $_SERVER['REMOTE_ADDR']     ?? '',
                     'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? '',
                 ]);
 
                 switch ($user['role']) {
                     case "admin":
                     case "superadmin":
-                        header("Location: admin_dashboard.php");
-                        exit;
                     case "assistant":
                     case "librarian":
                         header("Location: admin_dashboard.php");
@@ -55,23 +53,23 @@ if (isset($_POST['login'])) {
                 }
             } else {
                 authLogWrite($conn, [
-                    'user_id' => (int) $user['id'],
-                    'username' => (string) $user['username'],
-                    'role' => (string) $user['role'],
-                    'identity' => (string) $username,
-                    'action' => 'login_failed',
+                    'user_id'    => (int)    $user['id'],
+                    'username'   => (string) $user['username'],
+                    'role'       => (string) $user['role'],
+                    'identity'   => (string) $username,
+                    'action'     => 'login_failed',
                     'session_id' => session_id(),
-                    'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
+                    'ip_address' => $_SERVER['REMOTE_ADDR']     ?? '',
                     'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? '',
                 ]);
                 $message = "Invalid username or password.";
             }
         } else {
             authLogWrite($conn, [
-                'identity' => (string) $username,
-                'action' => 'login_failed',
+                'identity'   => (string) $username,
+                'action'     => 'login_failed',
                 'session_id' => session_id(),
-                'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
+                'ip_address' => $_SERVER['REMOTE_ADDR']     ?? '',
                 'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? '',
             ]);
             $message = "Invalid username or password.";
@@ -96,18 +94,16 @@ if (isset($_POST['login'])) {
         }
 
         :root {
-            --gold:        #c8a96e;
-            --gold-light:  #e2c99a;
-            --dark: #1a1f27;
-            --panel-bg:    rgba(255, 255, 255, 0.07);
-            --input-bg:    rgba(255, 255, 255, 0.09);
-            --input-border:rgba(200, 169, 110, 0.35);
-            --text-main:   #f0ece4;
-            --text-muted:  rgba(240, 236, 228, 0.55);
-            --error:       #f28b8b;
-            --success:     #7ec8a0;
-            --radius:      14px;
-            --transition:  0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            --gold:         #c8a96e;
+            --gold-light:   #e2c99a;
+            --dark:         #1a1f27;
+            --input-bg:     rgba(255, 255, 255, 0.09);
+            --input-border: rgba(200, 169, 110, 0.35);
+            --text-main:    #f0ece4;
+            --text-muted:   rgba(240, 236, 228, 0.55);
+            --error:        #f28b8b;
+            --success:      #7ec8a0;
+            --transition:   0.3s cubic-bezier(0.4, 0, 0.2, 1);
         }
 
         html, body {
@@ -118,8 +114,13 @@ if (isset($_POST['login'])) {
         body {
             font-family: 'DM Sans', sans-serif;
             background-color: var(--dark);
-            overflow: hidden;
+            /* bg-layer is fixed so the photo never scrolls —
+               only page content does on very short viewports */
+            overflow-y: auto;
+            overflow-x: hidden;
         }
+
+        /* ── Background & Overlay ──────────────────────────────────────────── */
         .bg-layer {
             position: fixed;
             inset: 0;
@@ -130,6 +131,7 @@ if (isset($_POST['login'])) {
             z-index: 0;
             filter: brightness(1.1);
         }
+
         .overlay {
             position: fixed;
             inset: 0;
@@ -143,21 +145,35 @@ if (isset($_POST['login'])) {
             );
             z-index: 1;
         }
+
+        /* ── Page Layout ───────────────────────────────────────────────────── */
         .page {
             position: relative;
             z-index: 2;
             display: flex;
-            align-items: stretch;
-            height: 100vh;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;        /* fills screen; allows growth if needed */
             width: 100%;
+            padding: 48px 24px;       /* breathing room top/bottom */
         }
+
+        .page-inner {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 48px;
+            width: min(1120px, 100%);
+        }
+
+        /* ── Brand Panel ───────────────────────────────────────────────────── */
         .brand-panel {
-            flex: 1;
             display: flex;
             flex-direction: column;
             justify-content: center;
             padding: 60px 64px;
-            max-width: 560px;
+            max-width: 520px;
+            align-self: center;
         }
 
         .brand-tag {
@@ -223,32 +239,39 @@ if (isset($_POST['login'])) {
             opacity: 0;
             animation: fadeUp 0.7s 0.65s ease forwards;
         }
+
+        /* ── Form Panel ────────────────────────────────────────────────────── */
+        /* Matches register.php: align-items flex-start so card top is always visible */
         .form-panel {
-            width: 420px;
+            width: 480px;
             min-width: 340px;
             display: flex;
-            align-items: center;
+            align-items: flex-start;
             justify-content: center;
-            padding: 48px 24px;
-            margin-right: 5vw;
+            padding: 0;
+            margin-right: 0;
         }
 
+        /* ── Form Card ─────────────────────────────────────────────────────── */
+        /* Slightly wider than the old 380px — feels less cramped, matches register */
         .form-card {
             width: 100%;
-            max-width: 380px;
+            max-width: 420px;
             background: rgba(255, 255, 255, 0.06);
             backdrop-filter: blur(24px) saturate(160%);
             -webkit-backdrop-filter: blur(24px) saturate(160%);
             border: 1px solid rgba(200, 169, 110, 0.18);
             border-radius: 22px;
-            padding: 44px 40px 40px;
+            padding: 44px 44px 40px;
             box-shadow:
                 0 8px 40px rgba(0, 0, 0, 0.45),
-                0 1px 0 rgba(255,255,255,0.06) inset;
+                0 1px 0 rgba(255, 255, 255, 0.06) inset;
             opacity: 0;
             transform: translateY(24px);
             animation: cardIn 0.75s 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
         }
+
+        /* ── Logo Section ──────────────────────────────────────────────────── */
         .logo-section {
             display: flex;
             flex-direction: column;
@@ -273,7 +296,7 @@ if (isset($_POST['login'])) {
             width: 52px;
             height: 52px;
             object-fit: contain;
-            filter: drop-shadow(0 2px 6px rgba(200,169,110,0.3));
+            filter: drop-shadow(0 2px 6px rgba(200, 169, 110, 0.3));
         }
 
         .school-name {
@@ -284,6 +307,8 @@ if (isset($_POST['login'])) {
             letter-spacing: 0.5px;
             text-align: center;
         }
+
+        /* ── Form Headings ─────────────────────────────────────────────────── */
         .form-heading {
             font-family: 'Cormorant Garamond', serif;
             font-size: 28px;
@@ -300,6 +325,8 @@ if (isset($_POST['login'])) {
             margin-bottom: 28px;
             letter-spacing: 0.3px;
         }
+
+        /* ── Message / Alert ───────────────────────────────────────────────── */
         .message {
             display: flex;
             align-items: center;
@@ -319,15 +346,10 @@ if (isset($_POST['login'])) {
             color: var(--success);
         }
 
-        .message::before {
-            content: '⚠';
-            font-size: 14px;
-            flex-shrink: 0;
-        }
+        .message::before         { content: '⚠'; font-size: 14px; flex-shrink: 0; }
+        .message.success::before { content: '✓'; }
 
-        .message.success::before {
-            content: '✓';
-        }
+        /* ── Form Fields ───────────────────────────────────────────────────── */
         .field {
             position: relative;
             margin-bottom: 16px;
@@ -353,7 +375,10 @@ if (isset($_POST['login'])) {
             font-family: 'DM Sans', sans-serif;
             font-size: 14.5px;
             outline: none;
-            transition: border-color var(--transition), box-shadow var(--transition), background var(--transition);
+            transition:
+                border-color var(--transition),
+                box-shadow var(--transition),
+                background var(--transition);
         }
 
         .field input::placeholder {
@@ -363,8 +388,10 @@ if (isset($_POST['login'])) {
         .field input:focus {
             border-color: var(--gold);
             background: rgba(255, 255, 255, 0.12);
-            box-shadow: 0 0 0 3px rgba(200, 169, 110, 0.15), 0 2px 8px rgba(0,0,0,0.2);
+            box-shadow: 0 0 0 3px rgba(200, 169, 110, 0.15), 0 2px 8px rgba(0, 0, 0, 0.2);
         }
+
+        /* ── Password Toggle ───────────────────────────────────────────────── */
         .field .toggle-pw {
             position: absolute;
             right: 14px;
@@ -377,13 +404,21 @@ if (isset($_POST['login'])) {
             user-select: none;
         }
 
-        .field .toggle-pw:hover {
-            color: var(--gold);
+        .field .toggle-pw:hover { color: var(--gold); }
+
+        /* ── Divider between fields and button ─────────────────────────────── */
+        /* A thin gold line to visually separate credentials from action,
+           same decorative treatment as the section labels in register.php */
+        .form-divider {
+            height: 1px;
+            background: rgba(200, 169, 110, 0.15);
+            margin: 8px 0 18px;
         }
+
+        /* ── Submit Button ─────────────────────────────────────────────────── */
         .btn-login {
             width: 100%;
             padding: 14px;
-            margin-top: 6px;
             border: none;
             border-radius: 10px;
             background: linear-gradient(135deg, #c8a96e 0%, #a07840 100%);
@@ -394,18 +429,12 @@ if (isset($_POST['login'])) {
             letter-spacing: 1px;
             text-transform: uppercase;
             cursor: pointer;
-            position: relative;
             overflow: hidden;
-            transition: transform var(--transition), box-shadow var(--transition), filter var(--transition);
+            transition:
+                transform var(--transition),
+                box-shadow var(--transition),
+                filter var(--transition);
             box-shadow: 0 4px 20px rgba(200, 169, 110, 0.3);
-        }
-
-        .btn-login::after {
-            content: '';
-            position: absolute;
-            inset: 0;
-            background: rgba(255,255,255,0);
-            transition: background var(--transition);
         }
 
         .btn-login:hover {
@@ -418,6 +447,8 @@ if (isset($_POST['login'])) {
             transform: translateY(0);
             box-shadow: 0 3px 12px rgba(200, 169, 110, 0.25);
         }
+
+        /* ── Register Link ─────────────────────────────────────────────────── */
         .register-link {
             text-align: center;
             margin-top: 22px;
@@ -437,6 +468,8 @@ if (isset($_POST['login'])) {
             color: var(--gold);
             border-bottom-color: var(--gold);
         }
+
+        /* ── Animations ────────────────────────────────────────────────────── */
         @keyframes fadeUp {
             from { opacity: 0; transform: translateY(16px); }
             to   { opacity: 1; transform: translateY(0); }
@@ -445,9 +478,9 @@ if (isset($_POST['login'])) {
         @keyframes cardIn {
             to { opacity: 1; transform: translateY(0); }
         }
-        @media (max-width: 860px) {
-            body { overflow: auto; }
 
+        /* ── Responsive ────────────────────────────────────────────────────── */
+        @media (max-width: 860px) {
             .overlay {
                 background: linear-gradient(
                     to bottom,
@@ -457,30 +490,27 @@ if (isset($_POST['login'])) {
             }
 
             .page {
-                flex-direction: column;
-                justify-content: flex-start;
-                align-items: center;
-                height: auto;
-                min-height: 100vh;
                 padding: 40px 20px 48px;
+            }
+
+            .page-inner {
+                flex-direction: column;
+                align-items: center;
+                gap: 32px;
             }
 
             .brand-panel {
                 max-width: 100%;
                 padding: 0;
                 text-align: center;
-                margin-bottom: 32px;
+                margin-bottom: 0;
+                align-self: auto;
+                align-items: center;
             }
 
-            .brand-tag {
-                justify-content: center;
-            }
-
+            .brand-tag { justify-content: center; }
             .brand-tag::before { display: none; }
-
-            .brand-sub {
-                max-width: 100%;
-            }
+            .brand-sub { max-width: 100%; }
 
             .form-panel {
                 width: 100%;
@@ -489,9 +519,7 @@ if (isset($_POST['login'])) {
                 padding: 0;
             }
 
-            .form-card {
-                padding: 36px 28px 32px;
-            }
+            .form-card { padding: 36px 28px 32px; }
         }
 
         @media (max-width: 400px) {
@@ -509,20 +537,25 @@ if (isset($_POST['login'])) {
     <div class="overlay"></div>
 
     <div class="page">
-        <div class="brand-panel">
-            <span class="brand-tag">Library Management System</span>
-            <h1 class="brand-title">A Space to<br><em>Learn & Grow</em></h1>
-            <p class="brand-sub">
-                Access curated resources, reserve your study space,
-                and connect with the knowledge you need — all in one place.
-            </p>
-            <div class="divider"></div>
-            <p class="brand-meta">St. Clare College of Caloocan &nbsp;·&nbsp; Est. 1969</p>
-        </div>
+        <div class="page-inner">
 
-        <div class="form-panel">
-            <div class="form-card">
+            <!-- ── Brand Panel ──────────────────────────────────────────────────── -->
+            <div class="brand-panel">
+                <span class="brand-tag">Library Management System</span>
+                <h1 class="brand-title">A Space to<br><em>Learn & Grow</em></h1>
+                <p class="brand-sub">
+                    Access curated resources, reserve your study space,
+                    and connect with the knowledge you need — all in one place.
+                </p>
+                <div class="divider"></div>
+                <p class="brand-meta">St. Clare College of Caloocan &nbsp;·&nbsp; Est. 1969</p>
+            </div>
 
+            <!-- ── Form Panel ───────────────────────────────────────────────────── -->
+            <div class="form-panel">
+                <div class="form-card">
+
+                <!-- Logo -->
                 <div class="logo-section">
                     <div class="logo-ring">
                         <img src="logo.png" alt="St. Clare College of Caloocan Logo">
@@ -533,13 +566,13 @@ if (isset($_POST['login'])) {
                 <h2 class="form-heading">Welcome Back</h2>
                 <p class="form-subheading">Sign in to continue to your account</p>
 
-                <?php if (isset($message_admin)) { ?>
+                <?php if (isset($message_admin)) : ?>
                     <div class="message success"><?= htmlspecialchars($message_admin) ?></div>
-                <?php } ?>
+                <?php endif; ?>
 
-                <?php if (isset($message)) { ?>
+                <?php if (isset($message)) : ?>
                     <div class="message"><?= htmlspecialchars($message) ?></div>
-                <?php } ?>
+                <?php endif; ?>
 
                 <form method="POST" autocomplete="on">
 
@@ -566,6 +599,9 @@ if (isset($_POST['login'])) {
                         <span class="toggle-pw" id="togglePw" title="Show / hide password">👁</span>
                     </div>
 
+                    <!-- Thin separator before the CTA — same decorative language as register -->
+                    <div class="form-divider"></div>
+
                     <button type="submit" name="login" class="btn-login">Sign In</button>
                 </form>
 
@@ -573,9 +609,10 @@ if (isset($_POST['login'])) {
                     Don't have an account? <a href="register.php">Register here</a>
                 </p>
 
+                </div>
             </div>
-        </div>
 
+        </div>
     </div>
 
     <script>

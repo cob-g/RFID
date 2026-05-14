@@ -243,8 +243,12 @@ function findUserByEmail(mysqli $conn, string $email): ?array
 {
     $normalizedEmail = strtolower(trim($email));
 
-    // First pass: exact match after normalization.
-    $stmt = $conn->prepare("\n        SELECT id, username, status, email\n        FROM users\n        WHERE LOWER(TRIM(email)) = ?\n        LIMIT 1\n    ");
+    $stmt = $conn->prepare("
+        SELECT id, username, status, email
+        FROM users
+        WHERE LOWER(TRIM(email)) = ?
+        LIMIT 1
+    ");
     $stmt->bind_param('s', $normalizedEmail);
     $stmt->execute();
     $user = $stmt->get_result()->fetch_assoc();
@@ -255,8 +259,34 @@ function findUserByEmail(mysqli $conn, string $email): ?array
 
 function usernameExists(mysqli $conn, string $username): bool
 {
-    $stmt = $conn->prepare("\n        SELECT id\n        FROM users\n        WHERE username = ?\n        LIMIT 1\n    ");
+    $stmt = $conn->prepare("
+        SELECT id
+        FROM users
+        WHERE username = ?
+        LIMIT 1
+    ");
     $stmt->bind_param('s', $username);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    return (bool) $row;
+}
+
+function studentIdExists(mysqli $conn, string $studentId): bool
+{
+    $studentId = trim($studentId);
+    if ($studentId === '' || !dbTableExists($conn, 'student_profiles')) {
+        return false;
+    }
+
+    $stmt = $conn->prepare("
+        SELECT user_id
+        FROM student_profiles
+        WHERE student_id = ?
+        LIMIT 1
+    ");
+    $stmt->bind_param('s', $studentId);
     $stmt->execute();
     $row = $stmt->get_result()->fetch_assoc();
     $stmt->close();
@@ -266,7 +296,7 @@ function usernameExists(mysqli $conn, string $username): bool
 
 function resendVerificationForExistingUser(mysqli $conn, array $user, string $email): void
 {
-    $userId = (int) ($user['id'] ?? 0);
+    $userId   = (int) ($user['id']       ?? 0);
     $username = (string) ($user['username'] ?? 'Student');
 
     if ($userId <= 0) {
@@ -276,7 +306,11 @@ function resendVerificationForExistingUser(mysqli $conn, array $user, string $em
 
     $newCode = generateVerificationCode();
 
-    $upd = $conn->prepare("\n        UPDATE users\n        SET verification_code = ?, status = 'pending'\n        WHERE id = ?\n    ");
+    $upd = $conn->prepare("
+        UPDATE users
+        SET verification_code = ?, status = 'pending'
+        WHERE id = ?
+    ");
     $upd->bind_param('si', $newCode, $userId);
     $upd->execute();
     $upd->close();
@@ -297,22 +331,50 @@ function resendVerificationForExistingUser(mysqli $conn, array $user, string $em
 // ════════════════════════════════════════════════════════════════════════════
 //  PAGE LOGIC
 // ════════════════════════════════════════════════════════════════════════════
-$message = '';
+$message       = '';
+$emailValue    = '';
+$usernameValue = '';
+$roleValue     = '';
+$studentIdValue = '';
+$courseValue   = '';
+$yearLevelValue = '';
+$sectionValue  = '';
+$addressValue  = '';
 
 if (isset($_POST['register'])) {
 
-    $username = trim($_POST['username'] ?? '');
-    $email    = strtolower(trim($_POST['email'] ?? ''));
-    $password = trim($_POST['password'] ?? '');
-    $role     = (string) ($_POST['role'] ?? '');
+    $username  = trim($_POST['username'] ?? '');
+    $email     = strtolower(trim($_POST['email'] ?? ''));
+    $password  = trim($_POST['password'] ?? '');
+    $role      = strtolower(trim((string) ($_POST['role'] ?? '')));
+    $studentId = trim((string) ($_POST['student_id'] ?? ''));
+    $course    = trim((string) ($_POST['course_or_department'] ?? ''));
+    $yearLevel = trim((string) ($_POST['year_level'] ?? ''));
+    $section   = trim((string) ($_POST['section'] ?? ''));
+    $address   = trim((string) ($_POST['address'] ?? ''));
+
+    $emailValue     = $email;
+    $usernameValue  = $username;
+    $roleValue      = $role;
+    $studentIdValue = $studentId;
+    $courseValue    = $course;
+    $yearLevelValue = $yearLevel;
+    $sectionValue   = $section;
+    $addressValue   = $address;
+
+    $allowedRoles = ['student', 'faculty'];
+    $isStudent    = ($role === 'student');
 
     if ($username === '' || $email === '' || $password === '') {
         $message = 'All fields are required.';
     } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
         $message = 'Please enter a valid email address.';
+    } elseif (!in_array($role, $allowedRoles, true)) {
+        $message = 'Please select a valid role.';
+    } elseif ($isStudent && ($studentId === '' || $course === '' || $yearLevel === '' || $section === '' || $address === '')) {
+        $message = 'Please complete all student profile fields.';
     } else {
 
-        // ── Pre-insert lookup to avoid confusing 1062 false positives ───────
         $existingEmailUser = findUserByEmail($conn, $email);
         if ($existingEmailUser) {
             $existingStatus = (string) ($existingEmailUser['status'] ?? '');
@@ -323,6 +385,8 @@ if (isset($_POST['register'])) {
             }
         } elseif (usernameExists($conn, $username)) {
             $message = 'Username already taken.';
+        } elseif ($isStudent && studentIdExists($conn, $studentId)) {
+            $message = 'Student ID already registered.';
         } else {
 
             $hashed            = password_hash($password, PASSWORD_DEFAULT);
@@ -330,10 +394,43 @@ if (isset($_POST['register'])) {
             $status            = 'pending';
 
             try {
-                $stmt = $conn->prepare("\n                    INSERT INTO users (username, email, password, role, verification_code, status)\n                    VALUES (?, ?, ?, ?, ?, ?)\n                ");
+                $conn->begin_transaction();
+
+                $stmt = $conn->prepare("
+                    INSERT INTO users (username, email, password, role, verification_code, status)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ");
                 $stmt->bind_param('ssssss', $username, $email, $hashed, $role, $verification_code, $status);
                 $stmt->execute();
+                $newUserId = (int) $conn->insert_id;
                 $stmt->close();
+
+                if ($isStudent) {
+                    studentProfileUpsert($conn, $newUserId, [
+                        'student_id'           => $studentId,
+                        'course_or_department' => $course,
+                        'year_level'           => $yearLevel,
+                        'section'              => $section,
+                        'address'              => $address,
+                    ]);
+                }
+
+                $conn->commit();
+
+                auditLogWrite($conn, [
+                    'actor_user_id'  => $newUserId,
+                    'actor_username' => $username,
+                    'actor_role'     => $role,
+                    'action'         => 'registration',
+                    'target_type'    => 'user',
+                    'target_id'      => $newUserId,
+                    'target_label'   => $username,
+                    'details'        => [
+                        'email'      => $email,
+                        'student_id' => $isStudent ? $studentId : '',
+                    ],
+                    'ip_address'     => $_SERVER['REMOTE_ADDR'] ?? '',
+                ]);
 
                 $emailSent = sendRegistrationEmail($email, $username, $verification_code);
                 if (!$emailSent) {
@@ -345,9 +442,9 @@ if (isset($_POST['register'])) {
                 exit();
 
             } catch (mysqli_sql_exception $e) {
+                $conn->rollback();
                 if ((int) $e->getCode() === 1062) {
 
-                    // Race-condition fallback: log which unique key failed.
                     error_log('[register.php] Duplicate key on INSERT: ' . $e->getMessage());
 
                     $existingEmailUser = findUserByEmail($conn, $email);
@@ -360,6 +457,8 @@ if (isset($_POST['register'])) {
                         }
                     } elseif (usernameExists($conn, $username)) {
                         $message = 'Username already taken.';
+                    } elseif ($isStudent && studentIdExists($conn, $studentId)) {
+                        $message = 'Student ID already registered.';
                     } else {
                         $message = 'A system error occurred while creating your account. Please try again.';
                         error_log('[register.php] 1062 but no matching user found after recheck (possible index/schema issue).');
@@ -369,6 +468,10 @@ if (isset($_POST['register'])) {
                     $message = 'A database error occurred. Please try again.';
                     error_log("[register.php] DB error: " . $e->getMessage());
                 }
+            } catch (Throwable $e) {
+                $conn->rollback();
+                $message = 'A system error occurred. Please try again.';
+                error_log('[register.php] Unexpected error: ' . $e->getMessage());
             }
         }
     }
@@ -413,12 +516,16 @@ if (isset($_POST['register'])) {
         body {
             font-family: 'DM Sans', sans-serif;
             background-color: var(--dark);
-            overflow: hidden;
+            /* ── Allow body scroll so the taller two-column form is always reachable
+               on very short viewports (e.g. 600 px laptops). The bg-layer is fixed,
+               so the photo never moves — only the content scrolls over it. ── */
+            overflow-y: auto;
+            overflow-x: hidden;
         }
 
         /* ── Background & Overlay ──────────────────────────────────────────── */
         .bg-layer {
-            position: fixed;
+            position: fixed;          /* stays locked while content scrolls */
             inset: 0;
             background-image: url('bg.jpg');
             background-size: cover;
@@ -429,7 +536,7 @@ if (isset($_POST['register'])) {
         }
 
         .overlay {
-            position: fixed;
+            position: fixed;          /* same — fixed behind everything */
             inset: 0;
             background: linear-gradient(
                 to right,
@@ -443,23 +550,37 @@ if (isset($_POST['register'])) {
         }
 
         /* ── Page Layout ───────────────────────────────────────────────────── */
+        /*
+         * Keep the two-column layout, but center both panels as a single group
+         * so the page breathes evenly on wide screens.
+         */
         .page {
             position: relative;
             z-index: 2;
             display: flex;
-            align-items: stretch;
-            height: 100vh;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;         /* fills screen; allows growth beyond it */
             width: 100%;
+            padding: 48px 24px;        /* breathing room top/bottom when scrolling */
+        }
+
+        .page-inner {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 48px;
+            width: min(1280px, 100%);
         }
 
         /* ── Brand Panel ───────────────────────────────────────────────────── */
         .brand-panel {
-            flex: 1;
             display: flex;
             flex-direction: column;
             justify-content: center;
             padding: 60px 64px;
-            max-width: 560px;
+            max-width: 520px;
+            align-self: center;        /* stays centred even when form panel is taller */
         }
 
         .brand-tag {
@@ -527,25 +648,35 @@ if (isset($_POST['register'])) {
         }
 
         /* ── Form Panel ────────────────────────────────────────────────────── */
+        /*
+         * Wider than before (560 px → ~600 px natural width) so the two-column
+         * student grid has comfortable breathing room. margin-right pushes it
+         * away from the screen edge on large monitors.
+         */
         .form-panel {
-            width: 440px;
-            min-width: 340px;
+            width: 660px;
+            min-width: 360px;
             display: flex;
-            align-items: center;
+            align-items: flex-start;   /* top-align so card growth goes downward */
             justify-content: center;
-            padding: 48px 24px;
-            margin-right: 5vw;
+            padding: 0;
+            margin-right: 0;
         }
 
+        /* ── Form Card ─────────────────────────────────────────────────────── */
+        /*
+         * max-width raised to 560 px (was 400 px) — more real estate for the
+         * two-column student grid. Padding also increased slightly.
+         */
         .form-card {
             width: 100%;
-            max-width: 400px;
+            max-width: 620px;
             background: rgba(255, 255, 255, 0.06);
             backdrop-filter: blur(24px) saturate(160%);
             -webkit-backdrop-filter: blur(24px) saturate(160%);
             border: 1px solid rgba(200, 169, 110, 0.18);
             border-radius: 22px;
-            padding: 40px 40px 36px;
+            padding: 44px 48px 40px;
             box-shadow:
                 0 8px 40px rgba(0, 0, 0, 0.45),
                 0 1px 0 rgba(255,255,255,0.06) inset;
@@ -594,7 +725,7 @@ if (isset($_POST['register'])) {
         /* ── Form Headings ─────────────────────────────────────────────────── */
         .form-heading {
             font-family: 'Cormorant Garamond', serif;
-            font-size: 26px;
+            font-size: 28px;
             font-weight: 300;
             color: var(--text-main);
             text-align: center;
@@ -629,14 +760,18 @@ if (isset($_POST['register'])) {
             color: var(--success);
         }
 
-        .message::before {
-            content: '⚠';
-            font-size: 14px;
-            flex-shrink: 0;
-        }
+        .message::before        { content: '⚠'; font-size: 14px; flex-shrink: 0; }
+        .message.success::before { content: '✓'; }
 
-        .message.success::before {
-            content: '✓';
+        /* ── Top-row fields: Email + Username side-by-side ─────────────────── */
+        /*
+         * The first two fields (Email, Username) are placed in a 2-column grid
+         * so the card feels balanced even before Student fields appear.
+         */
+        .fields-top-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0 16px;
         }
 
         /* ── Form Fields ───────────────────────────────────────────────────── */
@@ -675,7 +810,6 @@ if (isset($_POST['register'])) {
             color: rgba(240, 236, 228, 0.3);
         }
 
-        /* Style the select placeholder option */
         .field select option {
             background: #1e2530;
             color: var(--text-main);
@@ -709,6 +843,51 @@ if (isset($_POST['register'])) {
             box-shadow: 0 0 0 3px rgba(200, 169, 110, 0.15), 0 2px 8px rgba(0,0,0,0.2);
         }
 
+        /* ── Student Section Header ────────────────────────────────────────── */
+        .field-group-label {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 11px;
+            letter-spacing: 1.6px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin: 6px 0 14px;
+        }
+
+        /* decorative lines flanking the section label */
+        .field-group-label::before,
+        .field-group-label::after {
+            content: '';
+            flex: 1;
+            height: 1px;
+            background: rgba(200, 169, 110, 0.2);
+        }
+
+        /* ── Student Fields — hidden until role = student ──────────────────── */
+        .student-fields {
+            display: none;
+        }
+
+        .student-fields.active {
+            display: block;
+        }
+
+        /*
+         * Two-column grid for student info fields.
+         * Analogy: imagine a spreadsheet where each row has two cells.
+         * .field-full spans both cells (used for Address which is long).
+         */
+        .student-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;  /* two equal columns */
+            gap: 0 16px;                       /* 16 px horizontal gutter, 0 vertical (fields have margin-bottom) */
+        }
+
+        .field-full {
+            grid-column: 1 / -1;   /* -1 means "span to the last column" */
+        }
+
         /* ── Password Toggle ───────────────────────────────────────────────── */
         .field .toggle-pw {
             position: absolute;
@@ -722,8 +901,17 @@ if (isset($_POST['register'])) {
             user-select: none;
         }
 
-        .field .toggle-pw:hover {
-            color: var(--gold);
+        .field .toggle-pw:hover { color: var(--gold); }
+
+        /* ── Password + Role row ────────────────────────────────────────────── */
+        /*
+         * Password and Role sit side-by-side so the base form (before student
+         * fields) is compact and well-proportioned.
+         */
+        .fields-pw-role {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0 16px;
         }
 
         /* ── Submit Button ─────────────────────────────────────────────────── */
@@ -790,9 +978,7 @@ if (isset($_POST['register'])) {
         }
 
         /* ── Responsive ────────────────────────────────────────────────────── */
-        @media (max-width: 860px) {
-            body { overflow: auto; }
-
+        @media (max-width: 960px) {
             .overlay {
                 background: linear-gradient(
                     to bottom,
@@ -802,44 +988,50 @@ if (isset($_POST['register'])) {
             }
 
             .page {
-                flex-direction: column;
-                justify-content: flex-start;
-                align-items: center;
-                height: auto;
-                min-height: 100vh;
                 padding: 40px 20px 48px;
+            }
+
+            .page-inner {
+                flex-direction: column;
+                align-items: center;
+                gap: 32px;
             }
 
             .brand-panel {
                 max-width: 100%;
                 padding: 0;
                 text-align: center;
-                margin-bottom: 32px;
+                margin-bottom: 0;
+                align-self: auto;
+                align-items: center;
             }
 
-            .brand-tag {
-                justify-content: center;
-            }
-
+            .brand-tag { justify-content: center; }
             .brand-tag::before { display: none; }
-
-            .brand-sub {
-                max-width: 100%;
-            }
+            .brand-sub { max-width: 100%; }
 
             .form-panel {
                 width: 100%;
-                max-width: 440px;
+                max-width: 560px;
                 margin-right: 0;
                 padding: 0;
             }
 
-            .form-card {
-                padding: 34px 28px 30px;
-            }
+            .form-card { padding: 34px 28px 30px; }
         }
 
-        @media (max-width: 400px) {
+        /* Collapse two-column grids to single column on narrow phones */
+        @media (max-width: 500px) {
+            .fields-top-row,
+            .fields-pw-role,
+            .student-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .field-full {
+                grid-column: 1;   /* reset span — only one column anyway */
+            }
+
             .form-card {
                 padding: 28px 20px 24px;
                 border-radius: 16px;
@@ -854,23 +1046,24 @@ if (isset($_POST['register'])) {
     <div class="overlay"></div>
 
     <div class="page">
+        <div class="page-inner">
 
-        <!-- ── Brand Panel ──────────────────────────────────────────────────── -->
-        <div class="brand-panel">
-            <span class="brand-tag">Library Management System</span>
-            <h1 class="brand-title">Begin Your<br><em>Journey Here</em></h1>
-            <p class="brand-sub">
-                Join the community of learners. Create your account to
-                reserve study spaces, access curated resources, and stay
-                connected with the library system.
-            </p>
-            <div class="divider"></div>
-            <p class="brand-meta">St. Clare College of Caloocan &nbsp;·&nbsp; Est. 1969</p>
-        </div>
+            <!-- ── Brand Panel ──────────────────────────────────────────────────── -->
+            <div class="brand-panel">
+                <span class="brand-tag">Library Management System</span>
+                <h1 class="brand-title">Begin Your<br><em>Journey Here</em></h1>
+                <p class="brand-sub">
+                    Join the community of learners. Create your account to
+                    reserve study spaces, access curated resources, and stay
+                    connected with the library system.
+                </p>
+                <div class="divider"></div>
+                <p class="brand-meta">St. Clare College of Caloocan &nbsp;·&nbsp; Est. 1969</p>
+            </div>
 
-        <!-- ── Form Panel ───────────────────────────────────────────────────── -->
-        <div class="form-panel">
-            <div class="form-card">
+            <!-- ── Form Panel ───────────────────────────────────────────────────── -->
+            <div class="form-panel">
+                <div class="form-card">
 
                 <!-- Logo -->
                 <div class="logo-section">
@@ -890,54 +1083,130 @@ if (isset($_POST['register'])) {
 
                 <form method="POST" autocomplete="on">
 
-                    <!-- Email -->
-                    <div class="field">
-                        <label for="email">Email Address</label>
-                        <input
-                            type="email"
-                            id="email"
-                            name="email"
-                            placeholder="Enter your email"
-                            autocomplete="email"
-                            required>
-                    </div>
+                    <!-- Row 1: Email + Username -->
+                    <div class="fields-top-row">
+                        <div class="field">
+                            <label for="email">Email Address</label>
+                            <input
+                                type="email"
+                                id="email"
+                                name="email"
+                                placeholder="Enter your email"
+                                value="<?= htmlspecialchars($emailValue) ?>"
+                                autocomplete="email"
+                                required>
+                        </div>
 
-                    <!-- Username -->
-                    <div class="field">
-                        <label for="username">Username</label>
-                        <input
-                            type="text"
-                            id="username"
-                            name="username"
-                            placeholder="Choose a username"
-                            autocomplete="username"
-                            required>
-                    </div>
-
-                    <!-- Password -->
-                    <div class="field">
-                        <label for="password">Password</label>
-                        <input
-                            type="password"
-                            id="password"
-                            name="password"
-                            placeholder="Create a password"
-                            autocomplete="new-password"
-                            required>
-                        <span class="toggle-pw" id="togglePw" title="Show / hide password">👁</span>
-                    </div>
-
-                    <!-- Role -->
-                    <div class="field">
-                        <label for="role">Role</label>
-                        <div class="select-wrapper">
-                            <select id="role" name="role" required>
-                                <option value="" disabled selected>Select your role</option>
-                                <option value="student">Student</option>
-                                <option value="faculty">Faculty</option>
-                            </select>
+                        <div class="field">
+                            <label for="username">Username</label>
+                            <input
+                                type="text"
+                                id="username"
+                                name="username"
+                                placeholder="Choose a username"
+                                value="<?= htmlspecialchars($usernameValue) ?>"
+                                autocomplete="username"
+                                required>
                         </div>
                     </div>
+
+                    <!-- Row 2: Password + Role -->
+                    <div class="fields-pw-role">
+                        <div class="field">
+                            <label for="password">Password</label>
+                            <input
+                                type="password"
+                                id="password"
+                                name="password"
+                                placeholder="Create a password"
+                                autocomplete="new-password"
+                                required>
+                            <span class="toggle-pw" id="togglePw" title="Show / hide password">👁</span>
+                        </div>
+
+                        <div class="field">
+                            <label for="role">Role</label>
+                            <div class="select-wrapper">
+                                <select id="role" name="role" required>
+                                    <option value="" disabled <?= $roleValue === '' ? 'selected' : '' ?>>Select role</option>
+                                    <option value="student" <?= $roleValue === 'student' ? 'selected' : '' ?>>Student</option>
+                                    <option value="faculty" <?= $roleValue === 'faculty' ? 'selected' : '' ?>>Faculty</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Student-only fields — shown/hidden by JS, no change to logic -->
+                    <div id="studentFields" class="student-fields">
+
+                        <div class="field-group-label">Student Information</div>
+
+                        <!--
+                            Two-column grid layout:
+                            [Student ID]         [Course / Dept]
+                            [Year Level]         [Section]
+                            [Address — full width              ]
+                        -->
+                        <div class="student-grid">
+
+                            <div class="field">
+                                <label for="student_id">Student ID</label>
+                                <input
+                                    type="text"
+                                    id="student_id"
+                                    name="student_id"
+                                    placeholder="Enter student ID"
+                                    value="<?= htmlspecialchars($studentIdValue) ?>"
+                                    maxlength="40">
+                            </div>
+
+                            <div class="field">
+                                <label for="course_or_department">Course / Department</label>
+                                <input
+                                    type="text"
+                                    id="course_or_department"
+                                    name="course_or_department"
+                                    placeholder="e.g. BSCS, Nursing"
+                                    value="<?= htmlspecialchars($courseValue) ?>"
+                                    maxlength="120">
+                            </div>
+
+                            <div class="field">
+                                <label for="year_level">Year Level</label>
+                                <input
+                                    type="text"
+                                    id="year_level"
+                                    name="year_level"
+                                    placeholder="e.g. 2nd Year"
+                                    value="<?= htmlspecialchars($yearLevelValue) ?>"
+                                    maxlength="30">
+                            </div>
+
+                            <div class="field">
+                                <label for="section">Section</label>
+                                <input
+                                    type="text"
+                                    id="section"
+                                    name="section"
+                                    placeholder="e.g. Block A"
+                                    value="<?= htmlspecialchars($sectionValue) ?>"
+                                    maxlength="30">
+                            </div>
+
+                            <!-- Address spans both columns -->
+                            <div class="field field-full">
+                                <label for="address">Address</label>
+                                <input
+                                    type="text"
+                                    id="address"
+                                    name="address"
+                                    placeholder="Enter your address"
+                                    value="<?= htmlspecialchars($addressValue) ?>"
+                                    maxlength="255">
+                            </div>
+
+                        </div><!-- /.student-grid -->
+                    </div><!-- /#studentFields -->
 
                     <button type="submit" name="register" class="btn-register">Create Account</button>
                 </form>
@@ -946,20 +1215,41 @@ if (isset($_POST['register'])) {
                     Already have an account? <a href="index.php">Sign in here</a>
                 </p>
 
+                </div>
             </div>
-        </div>
 
+        </div>
     </div>
 
     <script>
-        const togglePw = document.getElementById('togglePw');
-        const pwInput  = document.getElementById('password');
+        // ── Password visibility toggle — unchanged ──────────────────────────
+        const togglePw    = document.getElementById('togglePw');
+        const pwInput     = document.getElementById('password');
+        const roleSelect  = document.getElementById('role');
+        const studentFields = document.getElementById('studentFields');
 
-        togglePw.addEventListener('click', () => {
-            const isText = pwInput.type === 'text';
-            pwInput.type = isText ? 'password' : 'text';
-            togglePw.textContent = isText ? '👁' : '🙈';
-        });
+        if (togglePw && pwInput) {
+            togglePw.addEventListener('click', () => {
+                const isText = pwInput.type === 'text';
+                pwInput.type = isText ? 'password' : 'text';
+                togglePw.textContent = isText ? '👁' : '🙈';
+            });
+        }
+
+        // ── Student fields show/hide + required toggle — unchanged ──────────
+        function toggleStudentFields() {
+            if (!roleSelect || !studentFields) return;
+            const isStudent = roleSelect.value === 'student';
+            studentFields.classList.toggle('active', isStudent);
+            studentFields.querySelectorAll('input').forEach(input => {
+                input.required = isStudent;
+            });
+        }
+
+        if (roleSelect) {
+            roleSelect.addEventListener('change', toggleStudentFields);
+        }
+        toggleStudentFields();
     </script>
 
 </body>

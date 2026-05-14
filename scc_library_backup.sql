@@ -41,6 +41,21 @@ CREATE TABLE `auth_log` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 
+CREATE TABLE `audit_log` (
+  `id` int(11) NOT NULL,
+  `actor_user_id` int(11) DEFAULT NULL,
+  `actor_username` varchar(80) DEFAULT NULL,
+  `actor_role` varchar(30) DEFAULT NULL,
+  `action` varchar(50) NOT NULL,
+  `target_type` varchar(40) DEFAULT NULL,
+  `target_id` int(11) DEFAULT NULL,
+  `target_label` varchar(120) DEFAULT NULL,
+  `details` text DEFAULT NULL,
+  `ip_address` varchar(45) DEFAULT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+
 CREATE TABLE `rfid_cards` (
   `id` int(11) NOT NULL,
   `name` varchar(100) NOT NULL,
@@ -229,6 +244,17 @@ CREATE TABLE `users` (
   `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
+CREATE TABLE `student_profiles` (
+  `user_id` int(11) NOT NULL,
+  `student_id` varchar(40) NOT NULL,
+  `course_or_department` varchar(120) NOT NULL,
+  `year_level` varchar(30) NOT NULL,
+  `section` varchar(30) NOT NULL,
+  `address` varchar(255) NOT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
 --
 -- Dumping data for table `users`
 --
@@ -268,6 +294,15 @@ ALTER TABLE `auth_log`
   ADD KEY `idx_auth_action_time` (`action`,`created_at`),
   ADD KEY `idx_auth_session` (`session_id`),
   ADD KEY `idx_auth_identity` (`identity`);
+
+--
+-- Indexes for table `audit_log`
+--
+ALTER TABLE `audit_log`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_audit_actor` (`actor_user_id`),
+  ADD KEY `idx_audit_action_time` (`action`,`created_at`),
+  ADD KEY `idx_audit_target` (`target_type`,`target_id`);
 
 --
 -- Indexes for table `computers`
@@ -338,6 +373,13 @@ ALTER TABLE `users`
   ADD UNIQUE KEY `email` (`email`);
 
 --
+-- Indexes for table `student_profiles`
+--
+ALTER TABLE `student_profiles`
+  ADD PRIMARY KEY (`user_id`),
+  ADD UNIQUE KEY `uq_student_profiles_student_id` (`student_id`);
+
+--
 -- AUTO_INCREMENT for dumped tables
 --
 
@@ -357,6 +399,12 @@ ALTER TABLE `attendance`
 -- AUTO_INCREMENT for table `auth_log`
 --
 ALTER TABLE `auth_log`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `audit_log`
+--
+ALTER TABLE `audit_log`
   MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
 
 --
@@ -424,6 +472,12 @@ ALTER TABLE `auth_log`
   ADD CONSTRAINT `auth_log_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE SET NULL ON UPDATE CASCADE;
 
 --
+-- Constraints for table `audit_log`
+--
+ALTER TABLE `audit_log`
+  ADD CONSTRAINT `audit_log_ibfk_1` FOREIGN KEY (`actor_user_id`) REFERENCES `users` (`id`) ON DELETE SET NULL ON UPDATE CASCADE;
+
+--
 -- Constraints for table `computers`
 --
 ALTER TABLE `computers`
@@ -452,6 +506,12 @@ ALTER TABLE `rfid_devices`
 --
 ALTER TABLE `rfid_cards`
   ADD CONSTRAINT `fk_rfid_cards_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE ON UPDATE CASCADE;
+
+--
+-- Constraints for table `student_profiles`
+--
+ALTER TABLE `student_profiles`
+  ADD CONSTRAINT `student_profiles_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE ON UPDATE CASCADE;
 
 --
 -- One-time rollout backfill (run after schema deploy)

@@ -100,7 +100,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['resend'])) {
     } else {
 
         $stmt = $conn->prepare("
-            SELECT id, username, status, verification_code
+            SELECT id, username, role, status, verification_code
             FROM   users
             WHERE  LOWER(TRIM(email)) = ?
             LIMIT  1
@@ -148,15 +148,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['resend'])) {
                 // WHERE status = 'pending' prevents a race condition where two
                 // simultaneous POST requests both try to verify the same account.
                 $upd = $conn->prepare("
-                    UPDATE users
-                    SET    status            = 'active',
-                           verification_code = NULL
-                    WHERE  id     = ?
-                      AND  status = 'pending'
+                        UPDATE users
+                        SET    status            = 'active',
+                               verification_code = NULL
+                        WHERE  id     = ?
+                          AND  status = 'pending'
                 ");
                 $upd->bind_param('i', $user['id']);
                 $upd->execute();
-                $upd->close();
+                    $updatedRows = $upd->affected_rows;
+                    $upd->close();
+
+                    if ($updatedRows > 0) {
+                        auditLogWrite($conn, [
+                            'actor_user_id' => (int) $user['id'],
+                            'actor_username' => (string) ($user['username'] ?? ''),
+                            'actor_role' => (string) ($user['role'] ?? ''),
+                            'action' => 'email_verified',
+                            'target_type' => 'user',
+                            'target_id' => (int) $user['id'],
+                            'target_label' => (string) ($user['username'] ?? ''),
+                            'details' => [
+                                'email' => $email,
+                            ],
+                            'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
+                        ]);
+                    }
+
+                    if (VERIFY_DEBUG) {
+                        error_log('[verify.php] UPDATE affected_rows=' . $updatedRows);
+                    }
 
                 if (VERIFY_DEBUG) {
                     error_log('[verify.php] UPDATE affected_rows=' . $upd->affected_rows);
@@ -193,7 +214,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['resend'])) {
             --transition:   0.3s cubic-bezier(0.4,0,0.2,1);
         }
         html, body { height: 100%; width: 100%; }
-        body { font-family: 'DM Sans', sans-serif; background-color: var(--dark); overflow: hidden; }
+        body {
+            font-family: 'DM Sans', sans-serif;
+            background-color: var(--dark);
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
         .bg-layer {
             position: fixed; inset: 0; background-image: url('bg.jpg');
             background-size: cover; background-position: center;
@@ -208,8 +234,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['resend'])) {
             );
             z-index: 1;
         }
-        .page { position: relative; z-index: 2; display: flex; align-items: stretch; height: 100vh; width: 100%; }
-        .brand-panel { flex: 1; display: flex; flex-direction: column; justify-content: center; padding: 60px 64px; max-width: 560px; }
+        .page {
+            position: relative;
+            z-index: 2;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            width: 100%;
+            padding: 48px 24px;
+        }
+
+        .page-inner {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 48px;
+            width: min(1120px, 100%);
+        }
+
+        .brand-panel {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            padding: 60px 64px;
+            max-width: 520px;
+            align-self: center;
+        }
         .brand-tag {
             display: inline-flex; align-items: center; gap: 8px;
             font-size: 11px; letter-spacing: 3px; text-transform: uppercase;
@@ -236,13 +287,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['resend'])) {
             opacity: 0; animation: fadeUp 0.7s 0.65s ease forwards;
         }
         .form-panel {
-            width: 440px; min-width: 340px; display: flex; align-items: center;
-            justify-content: center; padding: 48px 24px; margin-right: 5vw;
+            width: 480px;
+            min-width: 340px;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            padding: 0;
+            margin-right: 0;
         }
         .form-card {
-            width: 100%; max-width: 400px; background: rgba(255,255,255,0.06);
+            width: 100%; max-width: 420px; background: rgba(255,255,255,0.06);
             backdrop-filter: blur(24px) saturate(160%); -webkit-backdrop-filter: blur(24px) saturate(160%);
-            border: 1px solid rgba(200,169,110,0.18); border-radius: 22px; padding: 40px 40px 36px;
+            border: 1px solid rgba(200,169,110,0.18); border-radius: 22px; padding: 44px 44px 40px;
             box-shadow: 0 8px 40px rgba(0,0,0,0.45), 0 1px 0 rgba(255,255,255,0.06) inset;
             opacity: 0; transform: translateY(24px);
             animation: cardIn 0.75s 0.3s cubic-bezier(0.34,1.56,0.64,1) forwards;
@@ -321,10 +377,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['resend'])) {
         @keyframes fadeUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes cardIn { to { opacity: 1; transform: translateY(0); } }
         @media (max-width: 860px) {
-            body { overflow: auto; }
             .overlay { background: linear-gradient(to bottom, rgba(10,14,20,0.85) 0%, rgba(10,14,20,0.60) 100%); }
-            .page { flex-direction: column; justify-content: flex-start; align-items: center; height: auto; min-height: 100vh; padding: 40px 20px 48px; }
-            .brand-panel { max-width: 100%; padding: 0; text-align: center; margin-bottom: 32px; }
+            .page { padding: 40px 20px 48px; }
+            .page-inner { flex-direction: column; align-items: center; gap: 32px; }
+            .brand-panel { max-width: 100%; padding: 0; text-align: center; margin-bottom: 0; align-items: center; }
             .brand-tag { justify-content: center; }
             .brand-tag::before { display: none; }
             .brand-sub { max-width: 100%; }
@@ -338,19 +394,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['resend'])) {
     <div class="overlay"></div>
 
     <div class="page">
-        <div class="brand-panel">
-            <span class="brand-tag">Library Management System</span>
-            <h1 class="brand-title">Check Your<br><em>Inbox</em></h1>
-            <p class="brand-sub">
-                We sent a 6-digit verification code to your email address.
-                Enter it below to confirm your identity and activate your account.
-            </p>
-            <div class="divider"></div>
-            <p class="brand-meta">St. Clare College of Caloocan &nbsp;·&nbsp; Est. 1969</p>
-        </div>
+        <div class="page-inner">
+            <div class="brand-panel">
+                <span class="brand-tag">Library Management System</span>
+                <h1 class="brand-title">Check Your<br><em>Inbox</em></h1>
+                <p class="brand-sub">
+                    We sent a 6-digit verification code to your email address.
+                    Enter it below to confirm your identity and activate your account.
+                </p>
+                <div class="divider"></div>
+                <p class="brand-meta">St. Clare College of Caloocan &nbsp;·&nbsp; Est. 1969</p>
+            </div>
 
-        <div class="form-panel">
-            <div class="form-card">
+            <div class="form-panel">
+                <div class="form-card">
 
                 <div class="logo-section">
                     <div class="logo-ring">
@@ -430,6 +487,7 @@ POST code  : <?= htmlspecialchars($_POST['code']  ?? '', ENT_QUOTES) ?>
                     &nbsp;·&nbsp; <a href="index.php">Back to login</a>
                 </p>
 
+                </div>
             </div>
         </div>
     </div>
