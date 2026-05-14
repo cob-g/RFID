@@ -329,7 +329,7 @@ function studentProfileFetch(mysqli $conn, int $userId): ?array
     }
 
     $stmt = $conn->prepare(
-        'SELECT user_id, student_id, course_or_department, year_level, section, address'
+        'SELECT user_id, first_name, last_name, middle_initial, student_id, course_or_department, year_level, section, address'
         . ' FROM student_profiles WHERE user_id = ? LIMIT 1'
     );
     $stmt->bind_param('i', $userId);
@@ -346,6 +346,9 @@ function studentProfileUpsert(mysqli $conn, int $userId, array $profile): void
         return;
     }
 
+    $firstName = substr(trim((string) ($profile['first_name'] ?? '')), 0, 100);
+    $lastName = substr(trim((string) ($profile['last_name'] ?? '')), 0, 100);
+    $middleInitial = substr(trim((string) ($profile['middle_initial'] ?? '')), 0, 5);
     $studentId = substr(trim((string) ($profile['student_id'] ?? '')), 0, 40);
     $course = substr(trim((string) ($profile['course_or_department'] ?? '')), 0, 120);
     $yearLevel = substr(trim((string) ($profile['year_level'] ?? '')), 0, 30);
@@ -353,16 +356,19 @@ function studentProfileUpsert(mysqli $conn, int $userId, array $profile): void
     $address = substr(trim((string) ($profile['address'] ?? '')), 0, 255);
 
     $stmt = $conn->prepare(
-        'INSERT INTO student_profiles (user_id, student_id, course_or_department, year_level, section, address)'
-        . ' VALUES (?, ?, ?, ?, ?, ?)' 
+        'INSERT INTO student_profiles (user_id, first_name, last_name, middle_initial, student_id, course_or_department, year_level, section, address)'
+        . ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)' 
         . ' ON DUPLICATE KEY UPDATE'
+        . ' first_name = VALUES(first_name),'
+        . ' last_name = VALUES(last_name),'
+        . ' middle_initial = VALUES(middle_initial),'
         . ' student_id = VALUES(student_id),'
         . ' course_or_department = VALUES(course_or_department),'
         . ' year_level = VALUES(year_level),'
         . ' section = VALUES(section),'
         . ' address = VALUES(address)'
     );
-    $stmt->bind_param('isssss', $userId, $studentId, $course, $yearLevel, $section, $address);
+    $stmt->bind_param('issssssss', $userId, $firstName, $lastName, $middleInitial, $studentId, $course, $yearLevel, $section, $address);
     $stmt->execute();
     $stmt->close();
 }

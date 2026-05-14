@@ -340,6 +340,9 @@ $courseValue   = '';
 $yearLevelValue = '';
 $sectionValue  = '';
 $addressValue  = '';
+$firstNameValue = '';
+$middleInitialValue = '';
+$lastNameValue = '';
 
 if (isset($_POST['register'])) {
 
@@ -347,6 +350,9 @@ if (isset($_POST['register'])) {
     $email     = strtolower(trim($_POST['email'] ?? ''));
     $password  = trim($_POST['password'] ?? '');
     $role      = strtolower(trim((string) ($_POST['role'] ?? '')));
+    $firstName = trim((string) ($_POST['first_name'] ?? ''));
+    $middleInitial = trim((string) ($_POST['middle_initial'] ?? ''));
+    $lastName = trim((string) ($_POST['last_name'] ?? ''));
     $studentId = trim((string) ($_POST['student_id'] ?? ''));
     $course    = trim((string) ($_POST['course_or_department'] ?? ''));
     $yearLevel = trim((string) ($_POST['year_level'] ?? ''));
@@ -361,6 +367,9 @@ if (isset($_POST['register'])) {
     $yearLevelValue = $yearLevel;
     $sectionValue   = $section;
     $addressValue   = $address;
+    $firstNameValue = $firstName;
+    $middleInitialValue = $middleInitial;
+    $lastNameValue = $lastName;
 
     $allowedRoles = ['student', 'faculty'];
     $isStudent    = ($role === 'student');
@@ -371,7 +380,7 @@ if (isset($_POST['register'])) {
         $message = 'Please enter a valid email address.';
     } elseif (!in_array($role, $allowedRoles, true)) {
         $message = 'Please select a valid role.';
-    } elseif ($isStudent && ($studentId === '' || $course === '' || $yearLevel === '' || $section === '' || $address === '')) {
+    } elseif ($isStudent && ($firstName === '' || $lastName === '' || $studentId === '' || $course === '' || $yearLevel === '' || $section === '' || $address === '')) {
         $message = 'Please complete all student profile fields.';
     } else {
 
@@ -407,6 +416,9 @@ if (isset($_POST['register'])) {
 
                 if ($isStudent) {
                     studentProfileUpsert($conn, $newUserId, [
+                        'first_name'           => $firstName,
+                        'last_name'            => $lastName,
+                        'middle_initial'       => $middleInitial,
                         'student_id'           => $studentId,
                         'course_or_department' => $course,
                         'year_level'           => $yearLevel,
@@ -422,6 +434,9 @@ if (isset($_POST['register'])) {
                 ];
                 if ($isStudent) {
                     $auditDetails['student_profile'] = [
+                        'first_name' => $firstName,
+                        'last_name' => $lastName,
+                        'middle_initial' => $middleInitial,
                         'student_id' => $studentId,
                         'course_or_department' => $course,
                         'year_level' => $yearLevel,
@@ -1160,6 +1175,28 @@ if (isset($_POST['register'])) {
                         <div class="student-grid">
 
                             <div class="field">
+                                <label for="first_name">First Name</label>
+                                <input
+                                    type="text"
+                                    id="first_name"
+                                    name="first_name"
+                                    placeholder="Given name"
+                                    value="<?= htmlspecialchars($firstNameValue) ?>"
+                                    maxlength="100">
+                            </div>
+
+                            <div class="field">
+                                <label for="last_name">Last Name</label>
+                                <input
+                                    type="text"
+                                    id="last_name"
+                                    name="last_name"
+                                    placeholder="Family name"
+                                    value="<?= htmlspecialchars($lastNameValue) ?>"
+                                    maxlength="100">
+                            </div>
+
+                            <div class="field">
                                 <label for="student_id">Student ID</label>
                                 <input
                                     type="text"
@@ -1201,6 +1238,17 @@ if (isset($_POST['register'])) {
                                     placeholder="e.g. Block A"
                                     value="<?= htmlspecialchars($sectionValue) ?>"
                                     maxlength="30">
+                            </div>
+
+                            <div class="field">
+                                <label for="middle_initial">Middle Initial</label>
+                                <input
+                                    type="text"
+                                    id="middle_initial"
+                                    name="middle_initial"
+                                    placeholder="Optional"
+                                    value="<?= htmlspecialchars($middleInitialValue) ?>"
+                                    maxlength="5">
                             </div>
 
                             <!-- Address spans both columns -->

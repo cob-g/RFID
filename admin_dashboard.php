@@ -332,6 +332,9 @@ function adminDecodeAuditDetails(?string $raw): ?array
 function adminNormalizeStudentProfile(array $profile): array
 {
     $fields = [
+        'first_name' => trim((string) ($profile['first_name'] ?? '')),
+        'last_name' => trim((string) ($profile['last_name'] ?? '')),
+        'middle_initial' => trim((string) ($profile['middle_initial'] ?? '')),
         'student_id' => trim((string) ($profile['student_id'] ?? '')),
         'course_or_department' => trim((string) ($profile['course_or_department'] ?? '')),
         'year_level' => trim((string) ($profile['year_level'] ?? '')),
@@ -363,6 +366,9 @@ function adminExtractStudentProfileFromDetails(?array $details): array
     $profile = $details['student_profile'] ?? null;
     if (!is_array($profile)) {
         $profile = [
+            'first_name' => $details['first_name'] ?? '',
+            'last_name' => $details['last_name'] ?? '',
+            'middle_initial' => $details['middle_initial'] ?? '',
             'student_id' => $details['student_id'] ?? '',
             'course_or_department' => $details['course_or_department'] ?? '',
             'year_level' => $details['year_level'] ?? '',
@@ -377,6 +383,9 @@ function adminExtractStudentProfileFromDetails(?array $details): array
 function adminAuditDetailLabel(string $key): string
 {
     $map = [
+        'first_name' => 'First Name',
+        'last_name' => 'Last Name',
+        'middle_initial' => 'Middle Initial',
         'email' => 'Email',
         'student_id' => 'Student ID',
         'course_or_department' => 'Course/Department',
@@ -488,7 +497,7 @@ function adminFetchStudentProfiles(mysqli $conn, array $userIds): array
 
     $placeholders = implode(', ', array_fill(0, count($userIds), '?'));
     $types = str_repeat('i', count($userIds));
-    $sql = 'SELECT user_id, student_id, course_or_department, year_level, section, address'
+    $sql = 'SELECT user_id, first_name, last_name, middle_initial, student_id, course_or_department, year_level, section, address'
         . ' FROM student_profiles WHERE user_id IN (' . $placeholders . ')';
 
     $stmt = $conn->prepare($sql);

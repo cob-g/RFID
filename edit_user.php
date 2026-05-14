@@ -68,6 +68,9 @@ $courseInput = (string) ($studentProfile['course_or_department'] ?? '');
 $yearLevelInput = (string) ($studentProfile['year_level'] ?? '');
 $sectionInput = (string) ($studentProfile['section'] ?? '');
 $addressInput = (string) ($studentProfile['address'] ?? '');
+$firstNameInput = (string) ($studentProfile['first_name'] ?? '');
+$middleInitialInput = (string) ($studentProfile['middle_initial'] ?? '');
+$lastNameInput = (string) ($studentProfile['last_name'] ?? '');
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
     $csrf = (string) ($_POST['csrf'] ?? '');
@@ -78,6 +81,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
     $usernameInput = trim((string) ($_POST['username'] ?? ''));
     $roleInput = trim((string) ($_POST['role'] ?? ''));
     $password = (string) ($_POST['password'] ?? '');
+    $firstNameInput = trim((string) ($_POST['first_name'] ?? $firstNameInput));
+    $middleInitialInput = trim((string) ($_POST['middle_initial'] ?? $middleInitialInput));
+    $lastNameInput = trim((string) ($_POST['last_name'] ?? $lastNameInput));
     $studentIdInput = trim((string) ($_POST['student_id'] ?? $studentIdInput));
     $courseInput = trim((string) ($_POST['course_or_department'] ?? $courseInput));
     $yearLevelInput = trim((string) ($_POST['year_level'] ?? $yearLevelInput));
@@ -111,7 +117,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
 
         if ($roleInput === 'student') {
             $profileChanged = (
-                $studentIdInput !== (string) ($studentProfile['student_id'] ?? '')
+                $firstNameInput !== (string) ($studentProfile['first_name'] ?? '')
+                || $lastNameInput !== (string) ($studentProfile['last_name'] ?? '')
+                || $middleInitialInput !== (string) ($studentProfile['middle_initial'] ?? '')
+                || $studentIdInput !== (string) ($studentProfile['student_id'] ?? '')
                 || $courseInput !== (string) ($studentProfile['course_or_department'] ?? '')
                 || $yearLevelInput !== (string) ($studentProfile['year_level'] ?? '')
                 || $sectionInput !== (string) ($studentProfile['section'] ?? '')
@@ -136,6 +145,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
 
             if ($roleInput === 'student') {
                 studentProfileUpsert($conn, $id, [
+                    'first_name' => $firstNameInput,
+                    'last_name' => $lastNameInput,
+                    'middle_initial' => $middleInitialInput,
                     'student_id' => $studentIdInput,
                     'course_or_department' => $courseInput,
                     'year_level' => $yearLevelInput,
@@ -167,6 +179,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
             ];
             if ($roleInput === 'student') {
                 $auditDetails['student_profile'] = [
+                    'first_name' => $firstNameInput,
+                    'last_name' => $lastNameInput,
+                    'middle_initial' => $middleInitialInput,
                     'student_id' => $studentIdInput,
                     'course_or_department' => $courseInput,
                     'year_level' => $yearLevelInput,
@@ -881,6 +896,28 @@ body {
                                 <div class="field-group-label">Student Profile</div>
 
                                 <div class="field">
+                                    <label for="first_name">First Name</label>
+                                    <input
+                                        type="text"
+                                        id="first_name"
+                                        name="first_name"
+                                        value="<?= htmlspecialchars($firstNameInput) ?>"
+                                        maxlength="100"
+                                    >
+                                </div>
+
+                                <div class="field">
+                                    <label for="last_name">Last Name</label>
+                                    <input
+                                        type="text"
+                                        id="last_name"
+                                        name="last_name"
+                                        value="<?= htmlspecialchars($lastNameInput) ?>"
+                                        maxlength="100"
+                                    >
+                                </div>
+
+                                <div class="field">
                                     <label for="student_id">Student ID</label>
                                     <input
                                         type="text"
@@ -921,6 +958,17 @@ body {
                                         name="section"
                                         value="<?= htmlspecialchars($sectionInput) ?>"
                                         maxlength="30"
+                                    >
+                                </div>
+
+                                <div class="field">
+                                    <label for="middle_initial">Middle Initial</label>
+                                    <input
+                                        type="text"
+                                        id="middle_initial"
+                                        name="middle_initial"
+                                        value="<?= htmlspecialchars($middleInitialInput) ?>"
+                                        maxlength="5"
                                     >
                                 </div>
 
