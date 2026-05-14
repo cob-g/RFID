@@ -49,5 +49,6 @@ auditLogWrite($conn, [
 	'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
 ]);
 
+$_SESSION['redirect_to_users'] = true;
 header('Location: admin_dashboard.php?tab=users');
 exit;

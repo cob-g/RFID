@@ -343,6 +343,7 @@ $addressValue  = '';
 $firstNameValue = '';
 $middleInitialValue = '';
 $lastNameValue = '';
+$facultyLevelValue = '';
 
 if (isset($_POST['register'])) {
 
@@ -353,6 +354,7 @@ if (isset($_POST['register'])) {
     $firstName = trim((string) ($_POST['first_name'] ?? ''));
     $middleInitial = trim((string) ($_POST['middle_initial'] ?? ''));
     $lastName = trim((string) ($_POST['last_name'] ?? ''));
+    $facultyLevel = trim((string) ($_POST['faculty_level'] ?? ''));
     $studentId = trim((string) ($_POST['student_id'] ?? ''));
     $course    = trim((string) ($_POST['course_or_department'] ?? ''));
     $yearLevel = trim((string) ($_POST['year_level'] ?? ''));
@@ -370,9 +372,11 @@ if (isset($_POST['register'])) {
     $firstNameValue = $firstName;
     $middleInitialValue = $middleInitial;
     $lastNameValue = $lastName;
+    $facultyLevelValue = $facultyLevel;
 
     $allowedRoles = ['student', 'faculty'];
     $isStudent    = ($role === 'student');
+    $isFaculty    = ($role === 'faculty');
 
     if ($username === '' || $email === '' || $password === '') {
         $message = 'All fields are required.';
@@ -382,6 +386,8 @@ if (isset($_POST['register'])) {
         $message = 'Please select a valid role.';
     } elseif ($isStudent && ($firstName === '' || $lastName === '' || $studentId === '' || $course === '' || $yearLevel === '' || $section === '' || $address === '')) {
         $message = 'Please complete all student profile fields.';
+    } elseif ($isFaculty && $facultyLevel === '') {
+        $message = 'Please select a faculty type.';
     } else {
 
         $existingEmailUser = findUserByEmail($conn, $email);
@@ -396,6 +402,8 @@ if (isset($_POST['register'])) {
             $message = 'Username already taken.';
         } elseif ($isStudent && studentIdExists($conn, $studentId)) {
             $message = 'Student ID already registered.';
+        } elseif ($isFaculty && empty($_POST['faculty_level'])) {
+            $message = 'Please select a faculty type.';
         } else {
 
             $hashed            = password_hash($password, PASSWORD_DEFAULT);
@@ -426,6 +434,11 @@ if (isset($_POST['register'])) {
                         'address'              => $address,
                     ]);
                 }
+                if ($isFaculty) {
+                    facultyProfileUpsert($conn, $newUserId, [
+                        'faculty_level' => $facultyLevel,
+                    ]);
+                }
 
                 $conn->commit();
 
@@ -442,6 +455,11 @@ if (isset($_POST['register'])) {
                         'year_level' => $yearLevel,
                         'section' => $section,
                         'address' => $address,
+                    ];
+                }
+                if ($isFaculty) {
+                    $auditDetails['faculty_profile'] = [
+                        'faculty_level' => $facultyLevel,
                     ];
                 }
 
@@ -898,6 +916,15 @@ if (isset($_POST['register'])) {
             display: block;
         }
 
+        /* ── Faculty Fields — hidden until role = faculty ─────────────────── */
+        .faculty-fields {
+            display: none;
+        }
+
+        .faculty-fields.active {
+            display: block;
+        }
+
         /*
          * Two-column grid for student info fields.
          * Analogy: imagine a spreadsheet where each row has two cells.
@@ -1266,6 +1293,26 @@ if (isset($_POST['register'])) {
                         </div><!-- /.student-grid -->
                     </div><!-- /#studentFields -->
 
+                        <!-- Faculty-only fields — shown when role = faculty -->
+                        <div id="facultyFields" class="faculty-fields">
+
+                            <div class="field-group-label">Faculty Information</div>
+
+                            <div class="field">
+                                <label for="faculty_level">Faculty Type</label>
+                                <div class="select-wrapper">
+                                    <select id="faculty_level" name="faculty_level">
+                                        <option value="" disabled <?= $facultyLevelValue === '' ? 'selected' : '' ?>>Select faculty type</option>
+                                        <option value="tertiary" <?= $facultyLevelValue === 'tertiary' ? 'selected' : '' ?>>Tertiary</option>
+                                        <option value="senior_high" <?= $facultyLevelValue === 'senior_high' ? 'selected' : '' ?>>Senior High School</option>
+                                        <option value="junior_high" <?= $facultyLevelValue === 'junior_high' ? 'selected' : '' ?>>Junior High School</option>
+                                        <option value="basic_ed" <?= $facultyLevelValue === 'basic_ed' ? 'selected' : '' ?>>Basic Education</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                        </div><!-- /#facultyFields -->
+
                     <button type="submit" name="register" class="btn-register">Create Account</button>
                 </form>
 
@@ -1285,6 +1332,8 @@ if (isset($_POST['register'])) {
         const pwInput     = document.getElementById('password');
         const roleSelect  = document.getElementById('role');
         const studentFields = document.getElementById('studentFields');
+        const facultyFields = document.getElementById('facultyFields');
+        const facultySelect = document.getElementById('faculty_level');
 
         if (togglePw && pwInput) {
             togglePw.addEventListener('click', () => {
@@ -1296,12 +1345,21 @@ if (isset($_POST['register'])) {
 
         // ── Student fields show/hide + required toggle — unchanged ──────────
         function toggleStudentFields() {
-            if (!roleSelect || !studentFields) return;
+            if (!roleSelect) return;
             const isStudent = roleSelect.value === 'student';
-            studentFields.classList.toggle('active', isStudent);
-            studentFields.querySelectorAll('input').forEach(input => {
-                input.required = isStudent;
-            });
+            const isFaculty = roleSelect.value === 'faculty';
+
+            if (studentFields) {
+                studentFields.classList.toggle('active', isStudent);
+                studentFields.querySelectorAll('input').forEach(input => {
+                    input.required = isStudent;
+                });
+            }
+
+            if (facultyFields) {
+                facultyFields.classList.toggle('active', isFaculty);
+                if (facultySelect) facultySelect.required = isFaculty;
+            }
         }
 
         if (roleSelect) {

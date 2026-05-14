@@ -30,6 +30,8 @@ if (!$user) {
 }
 
 $current_role = strtolower((string) ($_SESSION['role'] ?? ''));
+$isSuperadmin = ($current_role === 'superadmin');
+$canViewLogs = in_array($current_role, ['admin', 'superadmin'], true);
 $target_role = strtolower((string) ($user['role'] ?? ''));
 
 if ($current_role === 'admin' && in_array($target_role, ['admin', 'superadmin'], true)) {
@@ -62,6 +64,8 @@ function studentIdTaken(mysqli $conn, string $studentId, int $currentUserId): bo
 $formError = '';
 $usernameInput = (string) ($user['username'] ?? '');
 $roleInput = (string) ($user['role'] ?? '');
+
+// Student profile data
 $studentProfile = studentProfileFetch($conn, $id);
 $studentIdInput = (string) ($studentProfile['student_id'] ?? '');
 $courseInput = (string) ($studentProfile['course_or_department'] ?? '');
@@ -72,6 +76,28 @@ $firstNameInput = (string) ($studentProfile['first_name'] ?? '');
 $middleInitialInput = (string) ($studentProfile['middle_initial'] ?? '');
 $lastNameInput = (string) ($studentProfile['last_name'] ?? '');
 
+// Faculty profile data
+$facultyProfile = [];
+$facultyFirstNameInput = '';
+$facultyLastNameInput = '';
+$facultyMiddleInitialInput = '';
+$facultyLevelInput = '';
+$facultyDepartmentInput = '';
+
+if (function_exists('facultyProfileFetch')) {
+    $facultyProfile = facultyProfileFetch($conn, $id);
+} else {
+    // Fallback in case helper isn't yet in db.php – avoids breaking the page
+    $facultyProfile = [];
+}
+if (!empty($facultyProfile)) {
+    $facultyFirstNameInput = (string) ($facultyProfile['first_name'] ?? '');
+    $facultyLastNameInput = (string) ($facultyProfile['last_name'] ?? '');
+    $facultyMiddleInitialInput = (string) ($facultyProfile['middle_initial'] ?? '');
+    $facultyLevelInput = (string) ($facultyProfile['faculty_level'] ?? '');
+    $facultyDepartmentInput = (string) ($facultyProfile['department'] ?? '');
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
     $csrf = (string) ($_POST['csrf'] ?? '');
     if (!hash_equals((string) $_SESSION['csrf_token'], $csrf)) {
@@ -81,6 +107,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
     $usernameInput = trim((string) ($_POST['username'] ?? ''));
     $roleInput = trim((string) ($_POST['role'] ?? ''));
     $password = (string) ($_POST['password'] ?? '');
+
+    // Student fields
     $firstNameInput = trim((string) ($_POST['first_name'] ?? $firstNameInput));
     $middleInitialInput = trim((string) ($_POST['middle_initial'] ?? $middleInitialInput));
     $lastNameInput = trim((string) ($_POST['last_name'] ?? $lastNameInput));
@@ -89,6 +117,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
     $yearLevelInput = trim((string) ($_POST['year_level'] ?? $yearLevelInput));
     $sectionInput = trim((string) ($_POST['section'] ?? $sectionInput));
     $addressInput = trim((string) ($_POST['address'] ?? $addressInput));
+
+    // Faculty fields
+    $facultyFirstNameInput = trim((string) ($_POST['faculty_first_name'] ?? $facultyFirstNameInput));
+    $facultyLastNameInput = trim((string) ($_POST['faculty_last_name'] ?? $facultyLastNameInput));
+    $facultyMiddleInitialInput = trim((string) ($_POST['faculty_middle_initial'] ?? $facultyMiddleInitialInput));
+    $facultyLevelInput = trim((string) ($_POST['faculty_level'] ?? $facultyLevelInput));
+    $facultyDepartmentInput = trim((string) ($_POST['faculty_department'] ?? $facultyDepartmentInput));
 
     if ($formError === '' && $usernameInput === '') {
         $formError = 'Username is required.';
@@ -102,6 +137,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
         $formError = 'You cannot assign this role.';
     }
 
+    // Student validation
     if ($formError === '' && $roleInput === 'student') {
         if ($studentIdInput === '' || $courseInput === '' || $yearLevelInput === '' || $sectionInput === '' || $addressInput === '') {
             $formError = 'Please complete all student profile fields.';
@@ -110,13 +146,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
         }
     }
 
+    // Faculty validation
+    if ($formError === '' && $roleInput === 'faculty') {
+        if ($facultyLevelInput === '') {
+            $formError = 'Faculty Level is required for faculty accounts.';
+        }
+        // Optional: require first/last name for faculty as well
+        if ($facultyFirstNameInput === '' || $facultyLastNameInput === '') {
+            $formError = 'First name and last name are required for faculty.';
+        }
+    }
+
     if ($formError === '') {
         $originalUsername = (string) ($user['username'] ?? '');
         $originalRole = (string) ($user['role'] ?? '');
-        $profileChanged = false;
+        $studentProfileChanged = false;
+        $facultyProfileChanged = false;
 
         if ($roleInput === 'student') {
-            $profileChanged = (
+            $studentProfileChanged = (
                 $firstNameInput !== (string) ($studentProfile['first_name'] ?? '')
                 || $lastNameInput !== (string) ($studentProfile['last_name'] ?? '')
                 || $middleInitialInput !== (string) ($studentProfile['middle_initial'] ?? '')
@@ -128,9 +176,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
             );
         }
 
+        if ($roleInput === 'faculty') {
+            $facultyProfileChanged = (
+                $facultyFirstNameInput !== (string) ($facultyProfile['first_name'] ?? '')
+                || $facultyLastNameInput !== (string) ($facultyProfile['last_name'] ?? '')
+                || $facultyMiddleInitialInput !== (string) ($facultyProfile['middle_initial'] ?? '')
+                || $facultyLevelInput !== (string) ($facultyProfile['faculty_level'] ?? '')
+                || $facultyDepartmentInput !== (string) ($facultyProfile['department'] ?? '')
+            );
+        }
+
         try {
             $conn->begin_transaction();
 
+            // Update users table
             if ($password !== '') {
                 $password_hash = password_hash($password, PASSWORD_DEFAULT);
                 $stmt = $conn->prepare('UPDATE users SET username = ?, role = ?, password = ? WHERE id = ?');
@@ -139,10 +198,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
                 $stmt = $conn->prepare('UPDATE users SET username = ?, role = ? WHERE id = ?');
                 $stmt->bind_param('ssi', $usernameInput, $roleInput, $id);
             }
-
             $stmt->execute();
             $stmt->close();
 
+            // Handle student profile
             if ($roleInput === 'student') {
                 studentProfileUpsert($conn, $id, [
                     'first_name' => $firstNameInput,
@@ -156,21 +215,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
                 ]);
             }
 
+            // Handle faculty profile (requires facultyProfileUpsert in db.php)
+            if ($roleInput === 'faculty' && function_exists('facultyProfileUpsert')) {
+                facultyProfileUpsert($conn, $id, [
+                    'first_name' => $facultyFirstNameInput,
+                    'last_name' => $facultyLastNameInput,
+                    'middle_initial' => $facultyMiddleInitialInput,
+                    'faculty_level' => $facultyLevelInput,
+                    'department' => $facultyDepartmentInput,
+                ]);
+            } elseif ($roleInput === 'faculty' && !function_exists('facultyProfileUpsert')) {
+                // Log error but allow commit – helper will be added later
+                error_log('[edit_user] facultyProfileUpsert missing, faculty data not saved');
+            }
+
             $conn->commit();
 
+            // Audit trail
             $changedFields = [];
-            if ($usernameInput !== $originalUsername) {
-                $changedFields[] = 'username';
-            }
-            if ($roleInput !== $originalRole) {
-                $changedFields[] = 'role';
-            }
-            if ($password !== '') {
-                $changedFields[] = 'password';
-            }
-            if ($profileChanged) {
-                $changedFields[] = 'student_profile';
-            }
+            if ($usernameInput !== $originalUsername) $changedFields[] = 'username';
+            if ($roleInput !== $originalRole) $changedFields[] = 'role';
+            if ($password !== '') $changedFields[] = 'password';
+            if ($studentProfileChanged) $changedFields[] = 'student_profile';
+            if ($facultyProfileChanged) $changedFields[] = 'faculty_profile';
 
             $auditDetails = [
                 'changed' => $changedFields,
@@ -187,6 +254,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update'])) {
                     'year_level' => $yearLevelInput,
                     'section' => $sectionInput,
                     'address' => $addressInput,
+                ];
+            }
+            if ($roleInput === 'faculty') {
+                $auditDetails['faculty_profile'] = [
+                    'first_name' => $facultyFirstNameInput,
+                    'last_name' => $facultyLastNameInput,
+                    'middle_initial' => $facultyMiddleInitialInput,
+                    'faculty_level' => $facultyLevelInput,
+                    'department' => $facultyDepartmentInput,
                 ];
             }
 
@@ -656,12 +732,12 @@ body {
     margin: 6px 0 4px;
 }
 
-.student-fields {
+.profile-fields {
     display: none;
     gap: 14px;
 }
 
-.student-fields.active {
+.profile-fields.active {
     display: grid;
 }
 
@@ -819,6 +895,19 @@ body {
             <a class="nav-link" href="admin_dashboard.php?tab=rfid-portal">
                 <span class="nav-icon">📡</span> RFID Portal
             </a>
+            <?php if ($canViewLogs): ?>
+            <a class="nav-link" href="admin_dashboard.php?tab=logs">
+                <span class="nav-icon">📋</span> Logs
+            </a>
+            <a class="nav-link" href="admin_dashboard.php?tab=logs-archive">
+                <span class="nav-icon">🗂️</span> Archived Logs
+            </a>
+            <?php endif; ?>
+            <?php if ($isSuperadmin): ?>
+            <a class="nav-link" href="admin_dashboard.php?tab=system-hours">
+                <span class="nav-icon">⏰</span> System Hours
+            </a>
+            <?php endif; ?>
         </div>
 
         <div class="sidebar-footer">
@@ -892,108 +981,82 @@ body {
                                 <div class="inline-note">Choose the access level this user should have.</div>
                             </div>
 
-                            <div id="studentFields" class="student-fields">
+                            <!-- Student Profile Fields -->
+                            <div id="studentFields" class="profile-fields">
                                 <div class="field-group-label">Student Profile</div>
 
                                 <div class="field">
                                     <label for="first_name">First Name</label>
-                                    <input
-                                        type="text"
-                                        id="first_name"
-                                        name="first_name"
-                                        value="<?= htmlspecialchars($firstNameInput) ?>"
-                                        maxlength="100"
-                                    >
+                                    <input type="text" id="first_name" name="first_name" value="<?= htmlspecialchars($firstNameInput) ?>" maxlength="100">
                                 </div>
-
                                 <div class="field">
                                     <label for="last_name">Last Name</label>
-                                    <input
-                                        type="text"
-                                        id="last_name"
-                                        name="last_name"
-                                        value="<?= htmlspecialchars($lastNameInput) ?>"
-                                        maxlength="100"
-                                    >
+                                    <input type="text" id="last_name" name="last_name" value="<?= htmlspecialchars($lastNameInput) ?>" maxlength="100">
                                 </div>
-
                                 <div class="field">
                                     <label for="student_id">Student ID</label>
-                                    <input
-                                        type="text"
-                                        id="student_id"
-                                        name="student_id"
-                                        value="<?= htmlspecialchars($studentIdInput) ?>"
-                                        maxlength="40"
-                                    >
+                                    <input type="text" id="student_id" name="student_id" value="<?= htmlspecialchars($studentIdInput) ?>" maxlength="40">
                                 </div>
-
                                 <div class="field">
                                     <label for="course_or_department">Course / Department</label>
-                                    <input
-                                        type="text"
-                                        id="course_or_department"
-                                        name="course_or_department"
-                                        value="<?= htmlspecialchars($courseInput) ?>"
-                                        maxlength="120"
-                                    >
+                                    <input type="text" id="course_or_department" name="course_or_department" value="<?= htmlspecialchars($courseInput) ?>" maxlength="120">
                                 </div>
-
                                 <div class="field">
                                     <label for="year_level">Year Level</label>
-                                    <input
-                                        type="text"
-                                        id="year_level"
-                                        name="year_level"
-                                        value="<?= htmlspecialchars($yearLevelInput) ?>"
-                                        maxlength="30"
-                                    >
+                                    <input type="text" id="year_level" name="year_level" value="<?= htmlspecialchars($yearLevelInput) ?>" maxlength="30">
                                 </div>
-
                                 <div class="field">
                                     <label for="section">Section</label>
-                                    <input
-                                        type="text"
-                                        id="section"
-                                        name="section"
-                                        value="<?= htmlspecialchars($sectionInput) ?>"
-                                        maxlength="30"
-                                    >
+                                    <input type="text" id="section" name="section" value="<?= htmlspecialchars($sectionInput) ?>" maxlength="30">
                                 </div>
-
                                 <div class="field">
                                     <label for="middle_initial">Middle Initial</label>
-                                    <input
-                                        type="text"
-                                        id="middle_initial"
-                                        name="middle_initial"
-                                        value="<?= htmlspecialchars($middleInitialInput) ?>"
-                                        maxlength="5"
-                                    >
+                                    <input type="text" id="middle_initial" name="middle_initial" value="<?= htmlspecialchars($middleInitialInput) ?>" maxlength="5">
                                 </div>
-
                                 <div class="field">
                                     <label for="address">Address</label>
-                                    <input
-                                        type="text"
-                                        id="address"
-                                        name="address"
-                                        value="<?= htmlspecialchars($addressInput) ?>"
-                                        maxlength="255"
-                                    >
+                                    <input type="text" id="address" name="address" value="<?= htmlspecialchars($addressInput) ?>" maxlength="255">
+                                </div>
+                            </div>
+
+                            <!-- Faculty Profile Fields -->
+                            <div id="facultyFields" class="profile-fields">
+                                <div class="field-group-label">Faculty Profile</div>
+
+                                <div class="field">
+                                    <label for="faculty_first_name">First Name</label>
+                                    <input type="text" id="faculty_first_name" name="faculty_first_name" value="<?= htmlspecialchars($facultyFirstNameInput) ?>" maxlength="100">
+                                </div>
+                                <div class="field">
+                                    <label for="faculty_last_name">Last Name</label>
+                                    <input type="text" id="faculty_last_name" name="faculty_last_name" value="<?= htmlspecialchars($facultyLastNameInput) ?>" maxlength="100">
+                                </div>
+                                <div class="field">
+                                    <label for="faculty_middle_initial">Middle Initial</label>
+                                    <input type="text" id="faculty_middle_initial" name="faculty_middle_initial" value="<?= htmlspecialchars($facultyMiddleInitialInput) ?>" maxlength="5">
+                                </div>
+                                <div class="field">
+                                    <label for="faculty_level">Faculty Level *</label>
+                                    <select id="faculty_level" name="faculty_level">
+                                        <option value="">-- Select Level --</option>
+                                        <option value="Instructor" <?= $facultyLevelInput === 'Instructor' ? 'selected' : '' ?>>Instructor</option>
+                                        <option value="Assistant Professor" <?= $facultyLevelInput === 'Assistant Professor' ? 'selected' : '' ?>>Assistant Professor</option>
+                                        <option value="Associate Professor" <?= $facultyLevelInput === 'Associate Professor' ? 'selected' : '' ?>>Associate Professor</option>
+                                        <option value="Professor" <?= $facultyLevelInput === 'Professor' ? 'selected' : '' ?>>Professor</option>
+                                        <option value="Lecturer" <?= $facultyLevelInput === 'Lecturer' ? 'selected' : '' ?>>Lecturer</option>
+                                        <option value="Professor Emeritus" <?= $facultyLevelInput === 'Professor Emeritus' ? 'selected' : '' ?>>Professor Emeritus</option>
+                                    </select>
+                                </div>
+                                <div class="field">
+                                    <label for="faculty_department">Department</label>
+                                    <input type="text" id="faculty_department" name="faculty_department" value="<?= htmlspecialchars($facultyDepartmentInput) ?>" maxlength="120">
                                 </div>
                             </div>
 
                             <div class="field">
                                 <label for="password">New Password</label>
                                 <div class="password-row">
-                                    <input
-                                        type="password"
-                                        id="password"
-                                        name="password"
-                                        placeholder="Leave blank to keep current password"
-                                        autocomplete="new-password"
-                                    >
+                                    <input type="password" id="password" name="password" placeholder="Leave blank to keep current password" autocomplete="new-password">
                                     <button type="button" class="pw-toggle" id="togglePassword">Show</button>
                                 </div>
                                 <div class="inline-note">Only fill this in when changing the password.</div>
@@ -1033,11 +1096,9 @@ function closeSidebar() {
 if (hamburger) {
     hamburger.addEventListener('click', openSidebar);
 }
-
 if (drawerOverlay) {
     drawerOverlay.addEventListener('click', closeSidebar);
 }
-
 document.addEventListener('keydown', event => {
     if (event.key === 'Escape') closeSidebar();
 });
@@ -1046,6 +1107,7 @@ const passwordInput = document.getElementById('password');
 const togglePassword = document.getElementById('togglePassword');
 const roleSelect = document.getElementById('role');
 const studentFields = document.getElementById('studentFields');
+const facultyFields = document.getElementById('facultyFields');
 
 if (togglePassword && passwordInput) {
     togglePassword.addEventListener('click', () => {
@@ -1055,20 +1117,48 @@ if (togglePassword && passwordInput) {
     });
 }
 
-function toggleStudentFields() {
-    if (!roleSelect || !studentFields) return;
-    const isStudent = roleSelect.value === 'student';
-    studentFields.classList.toggle('active', isStudent);
-    const inputs = studentFields.querySelectorAll('input');
-    inputs.forEach(input => {
-        input.required = isStudent;
-    });
+function toggleProfileFields() {
+    if (!roleSelect) return;
+    const selectedRole = roleSelect.value;
+
+    // Hide both sections initially
+    if (studentFields) studentFields.classList.remove('active');
+    if (facultyFields) facultyFields.classList.remove('active');
+
+    if (selectedRole === 'student' && studentFields) {
+        studentFields.classList.add('active');
+        // set required attributes for student fields
+        const studentInputs = studentFields.querySelectorAll('input, select');
+        studentInputs.forEach(input => { input.required = true; });
+        if (facultyFields) {
+            const facultyInputs = facultyFields.querySelectorAll('input, select');
+            facultyInputs.forEach(input => { input.required = false; });
+        }
+    } else if (selectedRole === 'faculty' && facultyFields) {
+        facultyFields.classList.add('active');
+        const facultyInputs = facultyFields.querySelectorAll('input, select');
+        facultyInputs.forEach(input => { input.required = true; });
+        if (studentFields) {
+            const studentInputs = studentFields.querySelectorAll('input, select');
+            studentInputs.forEach(input => { input.required = false; });
+        }
+    } else {
+        // neither student nor faculty – no profile fields required
+        if (studentFields) {
+            const studentInputs = studentFields.querySelectorAll('input, select');
+            studentInputs.forEach(input => { input.required = false; });
+        }
+        if (facultyFields) {
+            const facultyInputs = facultyFields.querySelectorAll('input, select');
+            facultyInputs.forEach(input => { input.required = false; });
+        }
+    }
 }
 
 if (roleSelect) {
-    roleSelect.addEventListener('change', toggleStudentFields);
+    roleSelect.addEventListener('change', toggleProfileFields);
 }
-toggleStudentFields();
+toggleProfileFields();
 </script>
 
 </body>

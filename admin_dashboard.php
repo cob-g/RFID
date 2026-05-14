@@ -18,6 +18,7 @@ $canViewLogs = in_array($current_role, ['admin', 'superadmin'], true);
 if (!defined('AUTH_SESSION_INACTIVE_SECONDS')) {
     define('AUTH_SESSION_INACTIVE_SECONDS', 300);
 }
+$archiveDefaultDays = 30;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_system_hours'])) {
     if (!$isSuperadmin) {
@@ -71,6 +72,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_system_hours']))
     exit;
 }
 
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['archive_logs'])) {
+    if (!$canViewLogs) {
+        $_SESSION['error'] = 'You do not have permission to archive logs.';
+        header('Location: admin_dashboard.php?tab=logs');
+        exit;
+    }
+
+    $csrf = (string) ($_POST['csrf'] ?? '');
+    if (!verifyCsrf($csrf)) {
+        $_SESSION['error'] = 'Invalid request token. Please refresh and try again.';
+        header('Location: admin_dashboard.php?tab=logs');
+        exit;
+    }
+
+    $archiveDays = adminNormalizeArchiveDays($_POST['archive_days'] ?? '', $archiveDefaultDays);
+    $cutoff = (new DateTimeImmutable('now'))->modify('-' . $archiveDays . ' days')->format('Y-m-d H:i:s');
+
+    try {
+        $attendanceStats = adminArchiveTable($conn, 'attendance', 'attendance_archive', 'created_at', $cutoff);
+        $authStats = adminArchiveTable($conn, 'auth_log', 'auth_log_archive', 'created_at', $cutoff);
+        $auditStats = adminArchiveTable($conn, 'audit_log', 'audit_log_archive', 'created_at', $cutoff);
+
+        $_SESSION['success'] = sprintf(
+            'Archived logs older than %d days. Attendance: %d, Auth: %d, Audit: %d.',
+            $archiveDays,
+            (int) $attendanceStats['deleted'],
+            (int) $authStats['deleted'],
+            (int) $auditStats['deleted']
+        );
+    } catch (Throwable $e) {
+        error_log('[admin_dashboard/archive_logs] ' . $e->getMessage());
+        $_SESSION['error'] = 'Unable to archive logs right now. Please try again.';
+    }
+
+    header('Location: admin_dashboard.php?tab=logs-archive');
+    exit;
+}
+
 $hoursState = libraryHoursEvaluate($conn);
 if (in_array($current_role, ['admin', 'librarian', 'assistant'], true) && !$hoursState['is_open']) {
     libraryHoursRenderClosedPage(
@@ -97,7 +136,11 @@ if ($hoursNextOpenDisplay === '') {
 
 $allowedInitialTabs = $isOpsRole
     ? ['dashboard', 'seats', 'computers', 'rfid-portal']
-    : ['dashboard', 'users', 'seats', 'computers', 'rfid-portal', 'logs'];
+    : ['dashboard', 'users', 'seats', 'computers', 'rfid-portal'];
+if ($canViewLogs) {
+    $allowedInitialTabs[] = 'logs';
+    $allowedInitialTabs[] = 'logs-archive';
+}
 if ($isSuperadmin) {
     $allowedInitialTabs[] = 'system-hours';
 }
@@ -194,6 +237,57 @@ function adminColumnExists(mysqli $conn, string $table, string $column): bool
 
     $cache[$key] = (bool) $exists;
     return $cache[$key];
+}
+
+function adminNormalizeArchiveDays($value, int $defaultDays): int
+{
+    $days = (int) $value;
+    if ($days <= 0) {
+        return $defaultDays;
+    }
+
+    return min($days, 3650);
+}
+
+function adminEnsureArchiveTable(mysqli $conn, string $sourceTable, string $archiveTable): void
+{
+    $sql = "CREATE TABLE IF NOT EXISTS `{$archiveTable}` LIKE `{$sourceTable}`";
+    $conn->query($sql);
+}
+
+function adminArchiveTable(mysqli $conn, string $sourceTable, string $archiveTable, string $dateColumn, string $cutoff): array
+{
+    if (!adminTableExists($conn, $sourceTable)) {
+        return ['archived' => 0, 'deleted' => 0];
+    }
+    if (!adminColumnExists($conn, $sourceTable, $dateColumn)) {
+        return ['archived' => 0, 'deleted' => 0];
+    }
+
+    adminEnsureArchiveTable($conn, $sourceTable, $archiveTable);
+
+    $conn->begin_transaction();
+    try {
+        $insertSql = "INSERT IGNORE INTO `{$archiveTable}` SELECT * FROM `{$sourceTable}` WHERE `{$dateColumn}` < ?";
+        $stmt = $conn->prepare($insertSql);
+        $stmt->bind_param('s', $cutoff);
+        $stmt->execute();
+        $archived = $stmt->affected_rows;
+        $stmt->close();
+
+        $deleteSql = "DELETE FROM `{$sourceTable}` WHERE `{$dateColumn}` < ?";
+        $stmt = $conn->prepare($deleteSql);
+        $stmt->bind_param('s', $cutoff);
+        $stmt->execute();
+        $deleted = $stmt->affected_rows;
+        $stmt->close();
+
+        $conn->commit();
+        return ['archived' => $archived, 'deleted' => $deleted];
+    } catch (Throwable $e) {
+        $conn->rollback();
+        throw $e;
+    }
 }
 
 function adminClampPage($value): int
@@ -380,6 +474,24 @@ function adminExtractStudentProfileFromDetails(?array $details): array
     return adminNormalizeStudentProfile($profile);
 }
 
+function adminExtractFacultyProfileFromDetails(?array $details): array
+{
+    if (!is_array($details)) {
+        return [];
+    }
+
+    $profile = $details['faculty_profile'] ?? null;
+    if (!is_array($profile)) {
+        $profile = [
+            'first_name' => $details['first_name'] ?? '',
+            'last_name' => $details['last_name'] ?? '',
+            'middle_initial' => $details['middle_initial'] ?? '',
+        ];
+    }
+
+    return adminNormalizeStudentProfile($profile);
+}
+
 function adminAuditDetailLabel(string $key): string
 {
     $map = [
@@ -515,6 +627,87 @@ function adminFetchStudentProfiles(mysqli $conn, array $userIds): array
     $stmt->close();
 
     return $profiles;
+}
+
+function adminFetchFacultyProfiles(mysqli $conn, array $userIds): array
+{
+    $userIds = array_values(array_unique(array_filter($userIds, static fn($value) => (int) $value > 0)));
+    if ($userIds === [] || !adminTableExists($conn, 'faculty_profiles')) {
+        return [];
+    }
+
+    $columns = ['user_id'];
+    foreach (['first_name', 'last_name', 'middle_initial', 'faculty_level', 'department'] as $column) {
+        if (adminColumnExists($conn, 'faculty_profiles', $column)) {
+            $columns[] = $column;
+        }
+    }
+
+    if (count($columns) === 1) {
+        return [];
+    }
+
+    $placeholders = implode(', ', array_fill(0, count($userIds), '?'));
+    $types = str_repeat('i', count($userIds));
+    $sql = 'SELECT ' . implode(', ', $columns)
+        . ' FROM faculty_profiles WHERE user_id IN (' . $placeholders . ')';
+
+    $stmt = $conn->prepare($sql);
+    dbBindParams($stmt, $types, $userIds);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $profiles = [];
+    while ($row = $result->fetch_assoc()) {
+        $userId = (int) ($row['user_id'] ?? 0);
+        if ($userId <= 0) {
+            continue;
+        }
+        $profiles[$userId] = $row;
+    }
+    $stmt->close();
+
+    return $profiles;
+}
+
+function adminResolveProfileDetails(int $userId, ?string $role, array $studentProfiles, array $facultyProfiles): array
+{
+    if ($userId <= 0) {
+        return ['', '', '', '', '', '', ''];
+    }
+
+    $role = strtolower(trim((string) $role));
+    $profile = [];
+    if ($role === 'faculty' && isset($facultyProfiles[$userId])) {
+        $profile = $facultyProfiles[$userId];
+    } elseif (isset($studentProfiles[$userId])) {
+        $profile = $studentProfiles[$userId];
+    } elseif (isset($facultyProfiles[$userId])) {
+        $profile = $facultyProfiles[$userId];
+    }
+
+    $studentProfile = $studentProfiles[$userId] ?? [];
+    $firstName = trim((string) ($profile['first_name'] ?? ''));
+    $lastName = trim((string) ($profile['last_name'] ?? ''));
+    $middleInitial = trim((string) ($profile['middle_initial'] ?? ''));
+    if ($firstName === '' && isset($studentProfile['first_name'])) {
+        $firstName = trim((string) ($studentProfile['first_name'] ?? ''));
+    }
+    if ($lastName === '' && isset($studentProfile['last_name'])) {
+        $lastName = trim((string) ($studentProfile['last_name'] ?? ''));
+    }
+    if ($middleInitial === '' && isset($studentProfile['middle_initial'])) {
+        $middleInitial = trim((string) ($studentProfile['middle_initial'] ?? ''));
+    }
+
+    return [
+        $firstName,
+        $lastName,
+        $middleInitial,
+        trim((string) ($studentProfile['student_id'] ?? '')),
+        trim((string) ($studentProfile['course_or_department'] ?? '')),
+        trim((string) ($studentProfile['year_level'] ?? '')),
+        trim((string) ($studentProfile['section'] ?? '')),
+    ];
 }
 
 function adminNormalizeDateInput(?string $value): ?string
@@ -780,7 +973,7 @@ function adminSendCsv(string $filename, array $headers, callable $writer): void
 function adminExportAttendanceEvents(mysqli $conn, array $filters): void
 {
     if (!adminTableExists($conn, 'attendance')) {
-        adminSendCsv('attendance_events.csv', ['Date Time', 'Action', 'User', 'Role', 'UID', 'Device'], static function () {
+        adminSendCsv('attendance_events.csv', ['Date Time', 'Action', 'User', 'Role', 'First Name', 'Last Name', 'Middle Initial', 'Student ID', 'Course / Department', 'Year Level', 'Section', 'UID', 'Device'], static function () {
         });
     }
 
@@ -807,6 +1000,37 @@ function adminExportAttendanceEvents(mysqli $conn, array $filters): void
     }
     $sql .= ' ORDER BY a.id DESC';
 
+    $studentProfiles = [];
+    $facultyProfiles = [];
+    if ($hasUserId) {
+        $idWhere = $where;
+        $idTypes = $types;
+        $idParams = $params;
+        $idWhere[] = 'a.user_id IS NOT NULL';
+        $idWhere[] = 'a.user_id > 0';
+
+        $idSql = 'SELECT DISTINCT a.user_id FROM attendance a';
+        $idSql .= ' LEFT JOIN users u ON u.id = a.user_id';
+        if ($idWhere !== []) {
+            $idSql .= ' WHERE ' . implode(' AND ', $idWhere);
+        }
+
+        $idStmt = $conn->prepare($idSql);
+        if ($idTypes !== '') {
+            dbBindParams($idStmt, $idTypes, $idParams);
+        }
+        $idStmt->execute();
+        $idResult = $idStmt->get_result();
+        $userIds = [];
+        while ($idRow = $idResult->fetch_assoc()) {
+            $userIds[] = (int) ($idRow['user_id'] ?? 0);
+        }
+        $idStmt->close();
+
+        $studentProfiles = adminFetchStudentProfiles($conn, $userIds);
+        $facultyProfiles = adminFetchFacultyProfiles($conn, $userIds);
+    }
+
     $stmt = $conn->prepare($sql);
     if ($types !== '') {
         dbBindParams($stmt, $types, $params);
@@ -814,7 +1038,7 @@ function adminExportAttendanceEvents(mysqli $conn, array $filters): void
     $stmt->execute();
     $result = $stmt->get_result();
 
-    adminSendCsv('attendance_events.csv', ['Date Time', 'Action', 'User', 'Role', 'UID', 'Device'], static function ($output) use ($result, $hasDevice) {
+    adminSendCsv('attendance_events.csv', ['Date Time', 'Action', 'User', 'Role', 'First Name', 'Last Name', 'Middle Initial', 'Student ID', 'Course / Department', 'Year Level', 'Section', 'UID', 'Device'], static function ($output) use ($result, $hasDevice, $studentProfiles, $facultyProfiles) {
         while ($row = $result->fetch_assoc()) {
             $userLabel = '—';
             $rowUserId = (int) ($row['user_id'] ?? 0);
@@ -827,12 +1051,25 @@ function adminExportAttendanceEvents(mysqli $conn, array $filters): void
             }
             $roleLabel = $row['role'] !== null && $row['role'] !== '' ? ucfirst((string) $row['role']) : '';
             $deviceLabel = $hasDevice ? (string) ($row['device'] ?? '') : '';
+            [$firstName, $lastName, $middleInitial, $studentId, $course, $yearLevel, $section] = adminResolveProfileDetails(
+                $rowUserId,
+                (string) ($row['role'] ?? ''),
+                $studentProfiles,
+                $facultyProfiles
+            );
 
             fputcsv($output, [
                 adminFormatDateTime($row['date'] ?? '', $row['time'] ?? ''),
                 (string) ($row['action'] ?? ''),
                 $userLabel,
                 $roleLabel,
+                $firstName,
+                $lastName,
+                $middleInitial,
+                $studentId,
+                $course,
+                $yearLevel,
+                $section,
                 (string) ($row['uid'] ?? ''),
                 $deviceLabel,
             ]);
@@ -843,7 +1080,7 @@ function adminExportAttendanceEvents(mysqli $conn, array $filters): void
 function adminExportAttendanceSessions(mysqli $conn, array $filters): void
 {
     if (!adminTableExists($conn, 'attendance')) {
-        adminSendCsv('attendance_sessions.csv', ['Time In', 'Time Out', 'Duration', 'User', 'Role', 'UID', 'Device'], static function () {
+        adminSendCsv('attendance_sessions.csv', ['Time In', 'Time Out', 'Duration', 'User', 'Role', 'First Name', 'Last Name', 'Middle Initial', 'Student ID', 'Course / Department', 'Year Level', 'Section', 'UID', 'Device'], static function () {
         });
     }
 
@@ -889,6 +1126,37 @@ function adminExportAttendanceSessions(mysqli $conn, array $filters): void
     }
     $sql .= ' ORDER BY a.id DESC';
 
+    $studentProfiles = [];
+    $facultyProfiles = [];
+    if ($hasUserId) {
+        $idWhere = $where;
+        $idTypes = $types;
+        $idParams = $params;
+        $idWhere[] = 'a.user_id IS NOT NULL';
+        $idWhere[] = 'a.user_id > 0';
+
+        $idSql = 'SELECT DISTINCT a.user_id FROM attendance a';
+        $idSql .= ' LEFT JOIN users u ON u.id = a.user_id';
+        if ($idWhere !== []) {
+            $idSql .= ' WHERE ' . implode(' AND ', $idWhere);
+        }
+
+        $idStmt = $conn->prepare($idSql);
+        if ($idTypes !== '') {
+            dbBindParams($idStmt, $idTypes, $idParams);
+        }
+        $idStmt->execute();
+        $idResult = $idStmt->get_result();
+        $userIds = [];
+        while ($idRow = $idResult->fetch_assoc()) {
+            $userIds[] = (int) ($idRow['user_id'] ?? 0);
+        }
+        $idStmt->close();
+
+        $studentProfiles = adminFetchStudentProfiles($conn, $userIds);
+        $facultyProfiles = adminFetchFacultyProfiles($conn, $userIds);
+    }
+
     $stmt = $conn->prepare($sql);
     if ($types !== '') {
         dbBindParams($stmt, $types, $params);
@@ -896,7 +1164,7 @@ function adminExportAttendanceSessions(mysqli $conn, array $filters): void
     $stmt->execute();
     $result = $stmt->get_result();
 
-    adminSendCsv('attendance_sessions.csv', ['Time In', 'Time Out', 'Duration', 'User', 'Role', 'UID', 'Device'], static function ($output) use ($result) {
+    adminSendCsv('attendance_sessions.csv', ['Time In', 'Time Out', 'Duration', 'User', 'Role', 'First Name', 'Last Name', 'Middle Initial', 'Student ID', 'Course / Department', 'Year Level', 'Section', 'UID', 'Device'], static function ($output) use ($result, $studentProfiles, $facultyProfiles) {
         while ($row = $result->fetch_assoc()) {
             $userLabel = '—';
             $rowUserId = (int) ($row['user_id'] ?? 0);
@@ -908,6 +1176,12 @@ function adminExportAttendanceSessions(mysqli $conn, array $filters): void
                 $userLabel = 'User #' . $rowUserId;
             }
             $roleLabel = $row['role'] !== null && $row['role'] !== '' ? ucfirst((string) $row['role']) : '';
+            [$firstName, $lastName, $middleInitial, $studentId, $course, $yearLevel, $section] = adminResolveProfileDetails(
+                $rowUserId,
+                (string) ($row['role'] ?? ''),
+                $studentProfiles,
+                $facultyProfiles
+            );
 
             $startStamp = strtotime(($row['time_in_date'] ?? '') . ' ' . ($row['time_in_time'] ?? ''));
             $endStamp = strtotime(($row['time_out_date'] ?? '') . ' ' . ($row['time_out_time'] ?? ''));
@@ -933,6 +1207,13 @@ function adminExportAttendanceSessions(mysqli $conn, array $filters): void
                 $durationLabel,
                 $userLabel,
                 $roleLabel,
+                $firstName,
+                $lastName,
+                $middleInitial,
+                $studentId,
+                $course,
+                $yearLevel,
+                $section,
                 (string) ($row['uid'] ?? ''),
                 $deviceLabel === '—' ? '' : $deviceLabel,
             ]);
@@ -943,19 +1224,54 @@ function adminExportAttendanceSessions(mysqli $conn, array $filters): void
 function adminExportAuthEvents(mysqli $conn, array $filters): void
 {
     if (!adminTableExists($conn, 'auth_log')) {
-        adminSendCsv('auth_events.csv', ['Date Time', 'Action', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function () {
+        adminSendCsv('auth_events.csv', ['Date Time', 'Action', 'Username', 'Identity', 'Role', 'First Name', 'Last Name', 'Middle Initial', 'Student ID', 'Course / Department', 'Year Level', 'Section', 'IP Address', 'Session', 'User Agent'], static function () {
         });
     }
 
+    $hasUserId = adminColumnExists($conn, 'auth_log', 'user_id');
     [$where, $types, $params] = adminBuildAuthWhere($filters, true);
     $where[] = "l.action <> 'heartbeat'";
 
-    $sql = "SELECT l.username, l.role, l.identity, l.action, l.session_id, l.ip_address, l.user_agent, l.created_at"
-        . " FROM auth_log l";
+    $columns = [];
+    if ($hasUserId) {
+        $columns[] = 'l.user_id';
+    }
+    $columns = array_merge($columns, ['l.username', 'l.role', 'l.identity', 'l.action', 'l.session_id', 'l.ip_address', 'l.user_agent', 'l.created_at']);
+    $sql = 'SELECT ' . implode(', ', $columns) . ' FROM auth_log l';
     if ($where !== []) {
         $sql .= ' WHERE ' . implode(' AND ', $where);
     }
     $sql .= ' ORDER BY l.id DESC';
+
+    $studentProfiles = [];
+    $facultyProfiles = [];
+    if ($hasUserId) {
+        $idWhere = $where;
+        $idTypes = $types;
+        $idParams = $params;
+        $idWhere[] = 'l.user_id IS NOT NULL';
+        $idWhere[] = 'l.user_id > 0';
+
+        $idSql = 'SELECT DISTINCT l.user_id FROM auth_log l';
+        if ($idWhere !== []) {
+            $idSql .= ' WHERE ' . implode(' AND ', $idWhere);
+        }
+
+        $idStmt = $conn->prepare($idSql);
+        if ($idTypes !== '') {
+            dbBindParams($idStmt, $idTypes, $idParams);
+        }
+        $idStmt->execute();
+        $idResult = $idStmt->get_result();
+        $userIds = [];
+        while ($idRow = $idResult->fetch_assoc()) {
+            $userIds[] = (int) ($idRow['user_id'] ?? 0);
+        }
+        $idStmt->close();
+
+        $studentProfiles = adminFetchStudentProfiles($conn, $userIds);
+        $facultyProfiles = adminFetchFacultyProfiles($conn, $userIds);
+    }
 
     $stmt = $conn->prepare($sql);
     if ($types !== '') {
@@ -964,14 +1280,28 @@ function adminExportAuthEvents(mysqli $conn, array $filters): void
     $stmt->execute();
     $result = $stmt->get_result();
 
-    adminSendCsv('auth_events.csv', ['Date Time', 'Action', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function ($output) use ($result) {
+    adminSendCsv('auth_events.csv', ['Date Time', 'Action', 'Username', 'Identity', 'Role', 'First Name', 'Last Name', 'Middle Initial', 'Student ID', 'Course / Department', 'Year Level', 'Section', 'IP Address', 'Session', 'User Agent'], static function ($output) use ($result, $studentProfiles, $facultyProfiles) {
         while ($row = $result->fetch_assoc()) {
+            $rowUserId = (int) ($row['user_id'] ?? 0);
+            [$firstName, $lastName, $middleInitial, $studentId, $course, $yearLevel, $section] = adminResolveProfileDetails(
+                $rowUserId,
+                (string) ($row['role'] ?? ''),
+                $studentProfiles,
+                $facultyProfiles
+            );
             fputcsv($output, [
                 adminFormatTimestamp($row['created_at'] ?? ''),
                 (string) ($row['action'] ?? ''),
                 (string) ($row['username'] ?? ''),
                 (string) ($row['identity'] ?? ''),
                 (string) ($row['role'] ?? ''),
+                $firstName,
+                $lastName,
+                $middleInitial,
+                $studentId,
+                $course,
+                $yearLevel,
+                $section,
                 (string) ($row['ip_address'] ?? ''),
                 (string) ($row['session_id'] ?? ''),
                 (string) ($row['user_agent'] ?? ''),
@@ -983,17 +1313,20 @@ function adminExportAuthEvents(mysqli $conn, array $filters): void
 function adminExportAuthSessions(mysqli $conn, array $filters): void
 {
     if (!adminTableExists($conn, 'auth_log')) {
-        adminSendCsv('auth_sessions.csv', ['Login', 'Logout', 'Duration', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function () {
+        adminSendCsv('auth_sessions.csv', ['Login', 'Logout', 'Duration', 'Username', 'Identity', 'Role', 'First Name', 'Last Name', 'Middle Initial', 'Student ID', 'Course / Department', 'Year Level', 'Section', 'IP Address', 'Session', 'User Agent'], static function () {
         });
     }
 
+    $hasUserId = adminColumnExists($conn, 'auth_log', 'user_id');
     [$where, $types, $params] = adminBuildAuthWhere($filters, false);
     $where[] = "l.action = 'login_success'";
 
     $lastActivitySql = "SELECT MAX(l2.created_at) FROM auth_log l2"
         . " WHERE l2.session_id = l.session_id AND l2.action IN ('login_success', 'logout', 'heartbeat')";
     $idleSecondsSql = "TIMESTAMPDIFF(SECOND, ({$lastActivitySql}), NOW())";
-    $sql = "SELECT l.username, l.role, l.identity, l.session_id, l.ip_address, l.user_agent, l.created_at AS login_at,"
+    $sql = "SELECT "
+        . ($hasUserId ? 'l.user_id, ' : '')
+        . "l.username, l.role, l.identity, l.session_id, l.ip_address, l.user_agent, l.created_at AS login_at,"
         . " (SELECT l2.created_at FROM auth_log l2 WHERE l2.action = 'logout' AND l2.id > l.id AND l2.session_id = l.session_id ORDER BY l2.id ASC LIMIT 1) AS logout_at,"
         . " ({$lastActivitySql}) AS last_activity_at,"
         . " ({$idleSecondsSql}) AS idle_seconds"
@@ -1011,7 +1344,37 @@ function adminExportAuthSessions(mysqli $conn, array $filters): void
     $result = $stmt->get_result();
 
     $inactiveSeconds = AUTH_SESSION_INACTIVE_SECONDS;
-    adminSendCsv('auth_sessions.csv', ['Login', 'Logout', 'Duration', 'Username', 'Identity', 'Role', 'IP Address', 'Session', 'User Agent'], static function ($output) use ($result, $inactiveSeconds) {
+    $studentProfiles = [];
+    $facultyProfiles = [];
+    if ($hasUserId) {
+        $idWhere = $where;
+        $idTypes = $types;
+        $idParams = $params;
+        $idWhere[] = 'l.user_id IS NOT NULL';
+        $idWhere[] = 'l.user_id > 0';
+
+        $idSql = 'SELECT DISTINCT l.user_id FROM auth_log l';
+        if ($idWhere !== []) {
+            $idSql .= ' WHERE ' . implode(' AND ', $idWhere);
+        }
+
+        $idStmt = $conn->prepare($idSql);
+        if ($idTypes !== '') {
+            dbBindParams($idStmt, $idTypes, $idParams);
+        }
+        $idStmt->execute();
+        $idResult = $idStmt->get_result();
+        $userIds = [];
+        while ($idRow = $idResult->fetch_assoc()) {
+            $userIds[] = (int) ($idRow['user_id'] ?? 0);
+        }
+        $idStmt->close();
+
+        $studentProfiles = adminFetchStudentProfiles($conn, $userIds);
+        $facultyProfiles = adminFetchFacultyProfiles($conn, $userIds);
+    }
+
+    adminSendCsv('auth_sessions.csv', ['Login', 'Logout', 'Duration', 'Username', 'Identity', 'Role', 'First Name', 'Last Name', 'Middle Initial', 'Student ID', 'Course / Department', 'Year Level', 'Section', 'IP Address', 'Session', 'User Agent'], static function ($output) use ($result, $inactiveSeconds, $studentProfiles, $facultyProfiles) {
         while ($row = $result->fetch_assoc()) {
             $startStamp = strtotime((string) ($row['login_at'] ?? ''));
             $endStamp = strtotime((string) ($row['logout_at'] ?? ''));
@@ -1023,6 +1386,14 @@ function adminExportAuthSessions(mysqli $conn, array $filters): void
                 $durationLabel = 'Inactive';
             }
 
+            $rowUserId = (int) ($row['user_id'] ?? 0);
+            [$firstName, $lastName, $middleInitial, $studentId, $course, $yearLevel, $section] = adminResolveProfileDetails(
+                $rowUserId,
+                (string) ($row['role'] ?? ''),
+                $studentProfiles,
+                $facultyProfiles
+            );
+
             fputcsv($output, [
                 adminFormatTimestamp($row['login_at'] ?? ''),
                 adminFormatTimestamp($row['logout_at'] ?? ''),
@@ -1030,6 +1401,13 @@ function adminExportAuthSessions(mysqli $conn, array $filters): void
                 (string) ($row['username'] ?? ''),
                 (string) ($row['identity'] ?? ''),
                 (string) ($row['role'] ?? ''),
+                $firstName,
+                $lastName,
+                $middleInitial,
+                $studentId,
+                $course,
+                $yearLevel,
+                $section,
                 (string) ($row['ip_address'] ?? ''),
                 (string) ($row['session_id'] ?? ''),
                 (string) ($row['user_agent'] ?? ''),
@@ -1120,7 +1498,7 @@ function adminExportComputers(mysqli $conn): void
 function adminExportAuditLog(mysqli $conn, array $filters): void
 {
     if (!adminTableExists($conn, 'audit_log')) {
-        adminSendCsv('audit_log.csv', ['Date Time', 'Action', 'Actor', 'Role', 'Target Type', 'Target', 'Target ID', 'Details', 'Student Profile', 'IP Address'], static function () {
+        adminSendCsv('audit_log.csv', ['Date Time', 'Action', 'Actor', 'Role', 'First Name', 'Last Name', 'Middle Initial', 'Student ID', 'Course / Department', 'Year Level', 'Section', 'Details', 'Student Profile', 'IP Address'], static function () {
         });
     }
 
@@ -1133,7 +1511,8 @@ function adminExportAuditLog(mysqli $conn, array $filters): void
     }
     $sql .= ' ORDER BY id DESC';
 
-    $profileByUserId = [];
+    $studentProfilesByUserId = [];
+    $facultyProfilesByUserId = [];
     if (
         adminTableExists($conn, 'student_profiles')
         && adminColumnExists($conn, 'audit_log', 'target_id')
@@ -1165,7 +1544,8 @@ function adminExportAuditLog(mysqli $conn, array $filters): void
         }
         $idStmt->close();
 
-        $profileByUserId = adminFetchStudentProfiles($conn, $userIds);
+        $studentProfilesByUserId = adminFetchStudentProfiles($conn, $userIds);
+        $facultyProfilesByUserId = adminFetchFacultyProfiles($conn, $userIds);
     }
 
     $stmt = $conn->prepare($sql);
@@ -1175,24 +1555,41 @@ function adminExportAuditLog(mysqli $conn, array $filters): void
     $stmt->execute();
     $result = $stmt->get_result();
 
-    adminSendCsv('audit_log.csv', ['Date Time', 'Action', 'Actor', 'Role', 'Target Type', 'Target', 'Target ID', 'Details', 'Student Profile', 'IP Address'], static function ($output) use ($result, $profileByUserId) {
+    adminSendCsv('audit_log.csv', ['Date Time', 'Action', 'Actor', 'Role', 'First Name', 'Last Name', 'Middle Initial', 'Student ID', 'Course / Department', 'Year Level', 'Section', 'Details', 'Student Profile', 'IP Address'], static function ($output) use ($result, $studentProfilesByUserId, $facultyProfilesByUserId) {
         while ($row = $result->fetch_assoc()) {
             $detailsRaw = (string) ($row['details'] ?? '');
             $decoded = adminDecodeAuditDetails($detailsRaw);
             $profileFromDetails = adminExtractStudentProfileFromDetails($decoded);
+            if ($profileFromDetails === []) {
+                $profileFromDetails = adminExtractFacultyProfileFromDetails($decoded);
+            }
             $targetId = (int) ($row['target_id'] ?? 0);
-            $profileFallback = adminNormalizeStudentProfile($profileByUserId[$targetId] ?? []);
+            $profileFallback = adminNormalizeStudentProfile($studentProfilesByUserId[$targetId] ?? []);
+            if ($profileFallback === [] && isset($facultyProfilesByUserId[$targetId])) {
+                $profileFallback = adminNormalizeStudentProfile($facultyProfilesByUserId[$targetId] ?? []);
+            }
             $profile = adminMergeStudentProfile($profileFromDetails, $profileFallback);
             $studentProfileCsv = adminFormatStudentProfileCsv($profile);
+            $firstName = (string) ($profile['first_name'] ?? '');
+            $lastName = (string) ($profile['last_name'] ?? '');
+            $middleInitial = (string) ($profile['middle_initial'] ?? '');
+            $studentId = (string) ($profile['student_id'] ?? '');
+            $course = (string) ($profile['course_or_department'] ?? '');
+            $yearLevel = (string) ($profile['year_level'] ?? '');
+            $section = (string) ($profile['section'] ?? '');
 
             fputcsv($output, [
                 adminFormatTimestamp($row['created_at'] ?? ''),
                 (string) ($row['action'] ?? ''),
                 (string) ($row['actor_username'] ?? ''),
                 (string) ($row['actor_role'] ?? ''),
-                (string) ($row['target_type'] ?? ''),
-                (string) ($row['target_label'] ?? ''),
-                (string) ($row['target_id'] ?? ''),
+                $firstName,
+                $lastName,
+                $middleInitial,
+                $studentId,
+                $course,
+                $yearLevel,
+                $section,
                 $detailsRaw,
                 $studentProfileCsv,
                 (string) ($row['ip_address'] ?? ''),
@@ -1753,6 +2150,74 @@ if ($auditLogAvailable && $auditEvents !== []) {
     }
 
     $auditProfilesByUserId = adminFetchStudentProfiles($conn, $auditUserIds);
+}
+
+$archiveLimit = 200;
+$attendanceArchiveAvailable = adminTableExists($conn, 'attendance_archive');
+$authArchiveAvailable = adminTableExists($conn, 'auth_log_archive');
+$auditArchiveAvailable = adminTableExists($conn, 'audit_log_archive');
+
+$attendanceArchiveTotal = 0;
+$authArchiveTotal = 0;
+$auditArchiveTotal = 0;
+
+$archiveAttendanceEvents = [];
+$archiveAuthEvents = [];
+$archiveAuditEvents = [];
+
+if ($attendanceArchiveAvailable) {
+    $countRow = $conn->query('SELECT COUNT(*) AS total FROM attendance_archive')->fetch_assoc();
+    $attendanceArchiveTotal = (int) ($countRow['total'] ?? 0);
+
+    $attendanceArchiveHasUserId = adminColumnExists($conn, 'attendance_archive', 'user_id');
+    $attendanceArchiveHasDevice = adminColumnExists($conn, 'attendance_archive', 'device');
+    $columns = ['a.id', 'a.name', 'a.uid', 'a.date', 'a.time', 'a.action', 'a.created_at'];
+    if ($attendanceArchiveHasDevice) {
+        $columns[] = 'a.device';
+    }
+    if ($attendanceArchiveHasUserId) {
+        $columns[] = 'a.user_id';
+        $columns[] = 'u.username';
+        $columns[] = 'u.role';
+    }
+
+    $sql = 'SELECT ' . implode(', ', $columns) . ' FROM attendance_archive a';
+    if ($attendanceArchiveHasUserId) {
+        $sql .= ' LEFT JOIN users u ON u.id = a.user_id';
+    }
+    $sql .= ' ORDER BY a.id DESC LIMIT ?';
+
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param('i', $archiveLimit);
+    $stmt->execute();
+    $archiveAttendanceEvents = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+}
+
+if ($authArchiveAvailable) {
+    $countRow = $conn->query('SELECT COUNT(*) AS total FROM auth_log_archive')->fetch_assoc();
+    $authArchiveTotal = (int) ($countRow['total'] ?? 0);
+
+    $sql = 'SELECT id, user_id, username, role, identity, action, session_id, ip_address, user_agent, created_at'
+        . ' FROM auth_log_archive ORDER BY id DESC LIMIT ?';
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param('i', $archiveLimit);
+    $stmt->execute();
+    $archiveAuthEvents = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+}
+
+if ($auditArchiveAvailable) {
+    $countRow = $conn->query('SELECT COUNT(*) AS total FROM audit_log_archive')->fetch_assoc();
+    $auditArchiveTotal = (int) ($countRow['total'] ?? 0);
+
+    $sql = 'SELECT id, actor_username, actor_role, action, target_type, target_id, target_label, details, ip_address, created_at'
+        . ' FROM audit_log_archive ORDER BY id DESC LIMIT ?';
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param('i', $archiveLimit);
+    $stmt->execute();
+    $archiveAuditEvents = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
 }
 
 $rfidUidByUserId = [];
@@ -3174,6 +3639,9 @@ tbody tr:last-child td { border-bottom: none; }
         <button class="tab-button <?= $initialTab === 'logs' ? 'active' : '' ?>" data-tab="logs">
             <span class="nav-icon">📋</span> Logs
         </button>
+        <button class="tab-button <?= $initialTab === 'logs-archive' ? 'active' : '' ?>" data-tab="logs-archive">
+            <span class="nav-icon">🗂️</span> Archived Logs
+        </button>
         <?php endif; ?>
         <?php if ($isSuperadmin): ?>
         <button class="tab-button <?= $initialTab === 'system-hours' ? 'active' : '' ?>" data-tab="system-hours">
@@ -3345,6 +3813,236 @@ tbody tr:last-child td { border-bottom: none; }
                         </tbody>
                     </table>
                 </div>
+            </div>
+        </section>
+
+        <section id="logs-archive" class="section <?= $initialTab === 'logs-archive' ? 'active' : '' ?>">
+            <div class="section-title">Archived Logs</div>
+
+            <div class="welcome-box no-print" style="margin-bottom:14px;">
+                Archived records older than <?= (int) $archiveDefaultDays ?> days are stored here. Latest <?= (int) $archiveLimit ?> entries per log type are shown.
+            </div>
+            <div class="welcome-box" style="margin-bottom:14px;">
+                Attendance: <?= (int) $attendanceArchiveTotal ?> | Auth: <?= (int) $authArchiveTotal ?> | Audit: <?= (int) $auditArchiveTotal ?>
+            </div>
+
+            <div class="section-subtitle">Archived Attendance Events</div>
+
+            <div class="table-wrap">
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date &amp; Time</th>
+                                <th>Action</th>
+                                <th>User</th>
+                                <th>UID</th>
+                                <th>Device</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php if (!$attendanceArchiveAvailable): ?>
+                                <tr class="empty-row"><td colspan="5">Attendance archive table not available.</td></tr>
+                            <?php elseif (empty($archiveAttendanceEvents)): ?>
+                                <tr class="empty-row"><td colspan="5">No archived attendance events found.</td></tr>
+                            <?php else: ?>
+                                <?php foreach ($archiveAttendanceEvents as $row): ?>
+                                    <?php
+                                    $userLabel = '—';
+                                    $userMeta = '';
+                                    $rowUserId = (int) ($row['user_id'] ?? 0);
+                                    if (!empty($row['username'])) {
+                                        $userLabel = (string) $row['username'];
+                                    } elseif (!empty($row['name'])) {
+                                        $userLabel = (string) $row['name'];
+                                    } elseif ($rowUserId > 0) {
+                                        $userLabel = 'User #' . $rowUserId;
+                                    }
+                                    if (!empty($row['role'])) {
+                                        $userMeta = ucfirst((string) $row['role']);
+                                    }
+                                    $action = strtoupper((string) ($row['action'] ?? ''));
+                                    $actionClass = $action === 'TIME_IN' ? 'success' : 'warn';
+                                    ?>
+                                    <tr>
+                                        <td><?= htmlspecialchars(adminFormatDateTime($row['date'] ?? '', $row['time'] ?? '')) ?></td>
+                                        <td><span class="badge <?= $actionClass ?>"><?= htmlspecialchars($action) ?></span></td>
+                                        <td>
+                                            <span style="font-weight:600; color:var(--text-main);">
+                                                <?= htmlspecialchars($userLabel) ?>
+                                            </span>
+                                            <?php if ($userMeta !== ''): ?>
+                                                <span class="cell-sub"><?= htmlspecialchars($userMeta) ?></span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace; font-size:0.80rem; color:var(--text-sub);">
+                                            <?= htmlspecialchars((string) ($row['uid'] ?? '—')) ?>
+                                        </td>
+                                        <td><?= htmlspecialchars((string) ($row['device'] ?? '—')) ?></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <?php if ($attendanceArchiveAvailable): ?>
+                    <div class="table-pagination">
+                        <div class="pagination-meta">
+                            Showing <?= min($attendanceArchiveTotal, $archiveLimit) ?> of <?= $attendanceArchiveTotal ?> archived events
+                        </div>
+                    </div>
+                <?php endif; ?>
+            </div>
+
+            <div class="section-subtitle">Archived Web Login Events</div>
+
+            <div class="table-wrap">
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date &amp; Time</th>
+                                <th>Action</th>
+                                <th>User / Identity</th>
+                                <th>Role</th>
+                                <th>Session</th>
+                                <th>User Agent</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php if (!$authArchiveAvailable): ?>
+                                <tr class="empty-row"><td colspan="6">Auth archive table not available.</td></tr>
+                            <?php elseif (empty($archiveAuthEvents)): ?>
+                                <tr class="empty-row"><td colspan="6">No archived login events found.</td></tr>
+                            <?php else: ?>
+                                <?php foreach ($archiveAuthEvents as $row): ?>
+                                    <?php
+                                    $action = (string) ($row['action'] ?? '');
+                                    $actionLabel = $action;
+                                    $actionClass = 'info';
+                                    if ($action === 'login_success') {
+                                        $actionLabel = 'Login';
+                                        $actionClass = 'success';
+                                    } elseif ($action === 'login_failed') {
+                                        $actionLabel = 'Login Failed';
+                                        $actionClass = 'danger';
+                                    } elseif ($action === 'logout') {
+                                        $actionLabel = 'Logout';
+                                        $actionClass = 'warn';
+                                    }
+                                    $identity = (string) ($row['identity'] ?? '');
+                                    $username = (string) ($row['username'] ?? '');
+                                    $userLabel = $username !== '' ? $username : ($identity !== '' ? $identity : '—');
+                                    $userMeta = ($username !== '' && $identity !== '' && $identity !== $username) ? ('ID: ' . $identity) : '';
+                                    $sessionFull = (string) ($row['session_id'] ?? '');
+                                    $sessionShort = $sessionFull !== '' ? adminTruncate($sessionFull, 12) : '—';
+                                    $agentFull = (string) ($row['user_agent'] ?? '');
+                                    $agentShort = $agentFull !== '' ? adminTruncate($agentFull, 48) : '—';
+                                    ?>
+                                    <tr>
+                                        <td><?= htmlspecialchars(adminFormatTimestamp($row['created_at'] ?? '')) ?></td>
+                                        <td><span class="badge <?= $actionClass ?>"><?= htmlspecialchars($actionLabel) ?></span></td>
+                                        <td>
+                                            <span style="font-weight:600; color:var(--text-main);">
+                                                <?= htmlspecialchars($userLabel) ?>
+                                            </span>
+                                            <?php if ($userMeta !== ''): ?>
+                                                <span class="cell-sub"><?= htmlspecialchars($userMeta) ?></span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td><?= htmlspecialchars($row['role'] !== null && $row['role'] !== '' ? ucfirst((string) $row['role']) : '—') ?></td>
+                                        <td title="<?= htmlspecialchars($sessionFull) ?>" style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace; font-size:0.80rem; color:var(--text-sub);">
+                                            <?= htmlspecialchars($sessionShort) ?>
+                                        </td>
+                                        <td title="<?= htmlspecialchars($agentFull) ?>">
+                                            <?= htmlspecialchars($agentShort) ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <?php if ($authArchiveAvailable): ?>
+                    <div class="table-pagination">
+                        <div class="pagination-meta">
+                            Showing <?= min($authArchiveTotal, $archiveLimit) ?> of <?= $authArchiveTotal ?> archived events
+                        </div>
+                    </div>
+                <?php endif; ?>
+            </div>
+
+            <div class="section-subtitle">Archived Admin Actions (Audit Log)</div>
+
+            <div class="table-wrap">
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date &amp; Time</th>
+                                <th>Action</th>
+                                <th>Actor</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php if (!$auditArchiveAvailable): ?>
+                                <tr class="empty-row"><td colspan="4">Audit archive table not available.</td></tr>
+                            <?php elseif (empty($archiveAuditEvents)): ?>
+                                <tr class="empty-row"><td colspan="4">No archived audit events found.</td></tr>
+                            <?php else: ?>
+                                <?php foreach ($archiveAuditEvents as $row): ?>
+                                    <?php
+                                    $actorLabel = (string) ($row['actor_username'] ?? '');
+                                    if ($actorLabel === '') {
+                                        $actorLabel = '—';
+                                    }
+                                    $actorMeta = (string) ($row['actor_role'] ?? '');
+                                    $detailsRaw = (string) ($row['details'] ?? '');
+                                    $detailLines = adminBuildAuditDetailLines($detailsRaw, null);
+                                    ?>
+                                    <tr>
+                                        <td><?= htmlspecialchars(adminFormatTimestamp($row['created_at'] ?? '')) ?></td>
+                                        <td><span class="badge info"><?= htmlspecialchars((string) ($row['action'] ?? '')) ?></span></td>
+                                        <td>
+                                            <span style="font-weight:600; color:var(--text-main);">
+                                                <?= htmlspecialchars($actorLabel) ?>
+                                            </span>
+                                            <?php if ($actorMeta !== ''): ?>
+                                                <span class="cell-sub"><?= htmlspecialchars(ucfirst($actorMeta)) ?></span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <?php if ($detailLines === []): ?>
+                                                —
+                                            <?php else: ?>
+                                                <div class="audit-details">
+                                                    <?php foreach ($detailLines as $detail): ?>
+                                                        <div class="audit-detail-row">
+                                                            <span class="audit-detail-label">
+                                                                <?= htmlspecialchars($detail['label']) ?>
+                                                            </span>
+                                                            <span class="audit-detail-value">
+                                                                <?= htmlspecialchars($detail['value']) ?>
+                                                            </span>
+                                                        </div>
+                                                    <?php endforeach; ?>
+                                                </div>
+                                            <?php endif; ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <?php if ($auditArchiveAvailable): ?>
+                    <div class="table-pagination">
+                        <div class="pagination-meta">
+                            Showing <?= min($auditArchiveTotal, $archiveLimit) ?> of <?= $auditArchiveTotal ?> archived entries
+                        </div>
+                    </div>
+                <?php endif; ?>
             </div>
         </section>
         <?php endif; ?>
@@ -3579,6 +4277,24 @@ tbody tr:last-child td { border-bottom: none; }
                 <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'export' => 'auth-sessions', 'authSessionPage' => null])) ?>">⬇️ Export Login Sessions CSV</a>
                 <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs', 'export' => 'audit-log', 'auditPage' => null])) ?>">⬇️ Export Audit Log CSV</a>
                 <button type="button" class="rfid-btn warn" id="btnPrintLogs">🖨️ Print Logs</button>
+            </div>
+
+            <div class="filter-panel no-print" style="margin-bottom:14px;">
+                <form method="post" class="filter-grid">
+                    <input type="hidden" name="archive_logs" value="1">
+                    <input type="hidden" name="csrf" value="<?= htmlspecialchars($_SESSION['csrf_token']) ?>">
+                    <div class="filter-field">
+                        <label for="archive_days">Archive logs older than (days)</label>
+                        <input type="number" id="archive_days" name="archive_days" min="1" max="3650" value="<?= (int) $archiveDefaultDays ?>">
+                    </div>
+                    <div class="filter-field">
+                        <label>&nbsp;</label>
+                        <div class="filter-actions">
+                            <button type="submit" class="rfid-btn warn">Archive Logs</button>
+                            <a class="rfid-btn" href="?<?= htmlspecialchars(adminBuildQuery(['tab' => 'logs-archive'])) ?>">View Archived Logs</a>
+                        </div>
+                    </div>
+                </form>
             </div>
 
             <div class="filter-panel no-print">
@@ -3923,16 +4639,15 @@ tbody tr:last-child td { border-bottom: none; }
                                 <th>Action</th>
                                 <th>User / Identity</th>
                                 <th>Role</th>
-                                <th>IP Address</th>
                                 <th>Session</th>
                                 <th>User Agent</th>
                             </tr>
                         </thead>
                         <tbody>
                             <?php if (!$authLogAvailable): ?>
-                                <tr class="empty-row"><td colspan="7">Auth log table not available.</td></tr>
+                                <tr class="empty-row"><td colspan="6">Auth log table not available.</td></tr>
                             <?php elseif (empty($authEvents)): ?>
-                                <tr class="empty-row"><td colspan="7">No login events found.</td></tr>
+                                <tr class="empty-row"><td colspan="6">No login events found.</td></tr>
                             <?php else: ?>
                                 <?php foreach ($authEvents as $row): ?>
                                     <?php
@@ -3970,7 +4685,6 @@ tbody tr:last-child td { border-bottom: none; }
                                             <?php endif; ?>
                                         </td>
                                         <td><?= htmlspecialchars($row['role'] !== null && $row['role'] !== '' ? ucfirst((string) $row['role']) : '—') ?></td>
-                                        <td><?= htmlspecialchars((string) ($row['ip_address'] ?? '—')) ?></td>
                                         <td title="<?= htmlspecialchars($sessionFull) ?>" style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace; font-size:0.80rem; color:var(--text-sub);">
                                             <?= htmlspecialchars($sessionShort) ?>
                                         </td>
@@ -4026,15 +4740,14 @@ tbody tr:last-child td { border-bottom: none; }
                                 <th>Logout</th>
                                 <th>Duration</th>
                                 <th>User / Identity</th>
-                                <th>IP Address</th>
                                 <th>Session</th>
                             </tr>
                         </thead>
                         <tbody>
                             <?php if (!$authLogAvailable): ?>
-                                <tr class="empty-row"><td colspan="6">Auth log table not available.</td></tr>
+                                <tr class="empty-row"><td colspan="5">Auth log table not available.</td></tr>
                             <?php elseif (empty($authSessions)): ?>
-                                <tr class="empty-row"><td colspan="6">No login sessions found.</td></tr>
+                                <tr class="empty-row"><td colspan="5">No login sessions found.</td></tr>
                             <?php else: ?>
                                 <?php foreach ($authSessions as $row): ?>
                                     <?php
@@ -4064,7 +4777,6 @@ tbody tr:last-child td { border-bottom: none; }
                                                 <span class="cell-sub"><?= htmlspecialchars($userMeta) ?></span>
                                             <?php endif; ?>
                                         </td>
-                                        <td><?= htmlspecialchars((string) ($row['ip_address'] ?? '—')) ?></td>
                                         <td title="<?= htmlspecialchars($sessionFull) ?>" style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace; font-size:0.80rem; color:var(--text-sub);">
                                             <?= htmlspecialchars($sessionShort) ?>
                                         </td>
@@ -4178,16 +4890,14 @@ tbody tr:last-child td { border-bottom: none; }
                                 <th>Date &amp; Time</th>
                                 <th>Action</th>
                                 <th>Actor</th>
-                                <th>Target</th>
-                                <th>IP Address</th>
                                 <th>Details</th>
                             </tr>
                         </thead>
                         <tbody>
                             <?php if (!$auditLogAvailable): ?>
-                                <tr class="empty-row"><td colspan="6">Audit log table not available.</td></tr>
+                                <tr class="empty-row"><td colspan="4">Audit log table not available.</td></tr>
                             <?php elseif (empty($auditEvents)): ?>
-                                <tr class="empty-row"><td colspan="6">No audit events found.</td></tr>
+                                <tr class="empty-row"><td colspan="4">No audit events found.</td></tr>
                             <?php else: ?>
                                 <?php foreach ($auditEvents as $row): ?>
                                     <?php
@@ -4196,15 +4906,6 @@ tbody tr:last-child td { border-bottom: none; }
                                         $actorLabel = '—';
                                     }
                                     $actorMeta = (string) ($row['actor_role'] ?? '');
-                                    $targetLabel = (string) ($row['target_label'] ?? '');
-                                    $targetType = (string) ($row['target_type'] ?? '');
-                                    $targetId = (string) ($row['target_id'] ?? '');
-                                    if ($targetLabel === '' && $targetId !== '') {
-                                        $targetLabel = 'ID #' . $targetId;
-                                    }
-                                    if ($targetLabel === '') {
-                                        $targetLabel = '—';
-                                    }
                                     $detailsRaw = (string) ($row['details'] ?? '');
                                     $targetProfileId = (int) ($row['target_id'] ?? 0);
                                     $detailLines = adminBuildAuditDetailLines(
@@ -4223,15 +4924,6 @@ tbody tr:last-child td { border-bottom: none; }
                                                 <span class="cell-sub"><?= htmlspecialchars(ucfirst($actorMeta)) ?></span>
                                             <?php endif; ?>
                                         </td>
-                                        <td>
-                                            <span style="font-weight:600; color:var(--text-main);">
-                                                <?= htmlspecialchars($targetLabel) ?>
-                                            </span>
-                                            <?php if ($targetType !== ''): ?>
-                                                <span class="cell-sub"><?= htmlspecialchars($targetType) ?></span>
-                                            <?php endif; ?>
-                                        </td>
-                                        <td><?= htmlspecialchars((string) ($row['ip_address'] ?? '—')) ?></td>
                                         <td>
                                             <?php if ($detailLines === []): ?>
                                                 —
@@ -4664,4 +5356,4 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSidebar
 </script>
 
 </body>
-</html>
+</html> 

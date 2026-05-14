@@ -372,3 +372,37 @@ function studentProfileUpsert(mysqli $conn, int $userId, array $profile): void
     $stmt->execute();
     $stmt->close();
 }
+
+function facultyProfileFetch(mysqli $conn, int $userId): ?array
+{
+    if ($userId <= 0 || !dbTableExists($conn, 'faculty_profiles')) {
+        return null;
+    }
+
+    $stmt = $conn->prepare(
+        'SELECT user_id, faculty_level, created_at, updated_at FROM faculty_profiles WHERE user_id = ? LIMIT 1'
+    );
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    return $row ?: null;
+}
+
+function facultyProfileUpsert(mysqli $conn, int $userId, array $profile): void
+{
+    if ($userId <= 0 || !dbTableExists($conn, 'faculty_profiles')) {
+        return;
+    }
+
+    $facultyLevel = substr(trim((string) ($profile['faculty_level'] ?? '')), 0, 32);
+
+    $stmt = $conn->prepare(
+        'INSERT INTO faculty_profiles (user_id, faculty_level) VALUES (?, ?)'
+        . ' ON DUPLICATE KEY UPDATE faculty_level = VALUES(faculty_level)'
+    );
+    $stmt->bind_param('is', $userId, $facultyLevel);
+    $stmt->execute();
+    $stmt->close();
+}
